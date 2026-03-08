@@ -4,12 +4,9 @@
   "scripts": {
     "start": "bun run get-history.js",
     "dev": "bun --watch get-history.js",
-    "clean": "rm -rf node_modules/.pnpm"
+    "reset": "rm -rf node_modules pnpm-lock.yaml && pnpm i"
   },
   "dependencies": {
     "cheerio": "1.0.0-rc.12"
-  },
-  "peerDependencies": {
-    "sqlite3": "*"
   }
 }
