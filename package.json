@@ -1,0 +1,15 @@
+{
+  "name": "youtube-history",
+  "type": "module",
+  "scripts": {
+    "start": "bun run get-history.js",
+    "dev": "bun --watch get-history.js",
+    "clean": "rm -rf node_modules/.pnpm"
+  },
+  "dependencies": {
+    "cheerio": "1.0.0-rc.12"
+  },
+  "peerDependencies": {
+    "sqlite3": "*"
+  }
+}
