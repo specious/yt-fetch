@@ -1,10 +1,15 @@
 {
-  "name": "youtube-history",
+  "name": "youtube-history-cli",
+  "version": "0.0.0",
   "type": "module",
+  "bin": {
+    "yt-history": "./bin/yt-history"
+  },
   "scripts": {
-    "start": "bun run get-history.js",
-    "dev": "bun --watch get-history.js",
-    "reset": "rm -rf node_modules pnpm-lock.yaml && pnpm i"
+    "start": "bun src/cli.js",
+    "dev": "bun --watch src/cli.js",
+    "build": "bun build src/cli.js --outdir lib --target node",
+    "test": "bun test"
   },
   "dependencies": {
     "cheerio": "1.0.0-rc.12"
