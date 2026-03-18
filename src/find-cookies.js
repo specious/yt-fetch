@@ -3,19 +3,20 @@ import { Glob } from 'bun'
 import os from 'os'
 import path from 'path'
 
-/**
- * Expand shell patterns: ~ → home, %VAR% → environment variables
- */
+//
+// Expand shell patterns: ~ → home dir, %VAR% → environment variable
+//
 function expandPath(pattern) {
   return pattern
     .replace(/~/g, os.homedir())
     .replace(/%([^%]+)%/g, (match, varName) => process.env[varName] || match)
 }
 
-/**
- * Smart cookie database discovery across all configured browsers
- * @returns {Promise<Array<{path, browser, profile, config}>>} Found databases
- */
+//
+// Smart cookie database discovery across all configured browsers
+//
+// Returns: Promise<Array<{path, browser, profile, config}>> (found databases)
+//
 export async function findAllCookies() {
   const results = []
 
@@ -60,21 +61,21 @@ export async function findAllCookies() {
     }
   }
 
-  // Sort by recency (modification time) then reverse path
-  results.sort((a, b) => {
-    // Most recently modified first
-    return 0 // Placeholder - add fs.stat if needed
-  })
+  // TODO: Sort by recency (modification time)
+  // results.sort((a, b) => {
+  //   // Most recently modified first (maybe check fs.stat)
+  //   return 0
+  // })
 
   console.log(`\n📊 Total: ${results.length} cookie databases found`)
   return results
 }
 
-/**
- * Select best database (Firefox preferred, then largest file, interactive picker)
- * @param {Array} candidates - From findAllCookies()
- * @returns {Promise<{path, browser, profile, config}>} Selected database
- */
+//
+// Select best database (Firefox preferred)
+//
+// TODO: Consier: most recently modified, largest file, interactive picker
+//
 export async function selectDatabase(candidates) {
   if (candidates.length === 0) {
     throw new Error('No browser cookie databases found')
@@ -87,9 +88,10 @@ export async function selectDatabase(candidates) {
     return firefox
   }
 
-  // Show top 5 candidates
-  console.log(`\n📂 Found cookie databases:`)
-  candidates.slice(0, 5).forEach((candidate, i) => {
+  console.log(`\n📂 Cookie database candidates:`)
+  console.log()
+
+  candidates.forEach((candidate, i) => {
     const shortPath = path.relative(process.env.HOME || '~', candidate.profile)
     console.log(`  ${i + 1}. ${candidate.browser} (${shortPath})`)
   })

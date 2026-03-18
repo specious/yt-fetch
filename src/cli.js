@@ -1,13 +1,12 @@
 import os from 'os'
 import path from 'path'
 import fs from 'fs/promises'
-import https from 'https'
-import crypto from 'crypto'
-import * as cheerio from 'cheerio'
 import { Database } from 'bun:sqlite'
 
-import { findAllCookies, selectDatabase } from './find-cookies.js'
 import { getQuery } from './browsers.js'
+import { findAllCookies, selectDatabase } from './find-cookies.js'
+import { normalizeCookies } from './normalize-cookies.js'
+import { scrapeHistory } from './scrape.js'
 
 async function getYoutubeCookies(profilePath, config) {
   console.log(`\n📂 Source: ${profilePath}`)
@@ -34,31 +33,17 @@ async function getYoutubeCookies(profilePath, config) {
 }
 
 async function readAndCleanup(dbPath, config) {
-  let cookies
   try {
-    cookies = await readCookies(dbPath, config)
+    return await readCookies(dbPath, config)
   } finally {
-    // Cleanup AFTER readCookies() completes
+    // Cleanup temp files (main + WAL/SHM)
     const baseName = path.basename(dbPath, '.sqlite')
     const tmpDir = path.dirname(dbPath)
-    ;['.sqlite', '.sqlite-wal', '.sqlite-shm'].forEach(ext => {
-      fs.unlink(path.join(tmpDir, `${baseName}${ext}`)).catch(() => {})
-    })
-  }
-  return cookies
-}
+    const files = [`${baseName}.sqlite`, `${baseName}.sqlite-wal`, `${baseName}.sqlite-shm`]
 
-// async function readAndCleanup(dbPath, config) {
-//   try {
-//     return await readCookies(dbPath, config)
-//   } finally {
-//     // Cleanup temp files (main + WAL/SHM)
-//     const baseName = path.basename(dbPath, '.sqlite')
-//     const tmpDir = path.dirname(dbPath)
-//     const files = [`${baseName}.sqlite`, `${baseName}.sqlite-wal`, `${baseName}.sqlite-shm`]
-//     await Promise.all(files.map(f => fs.unlink(path.join(tmpDir, f)).catch(() => {})))
-//   }
-// }
+    await Promise.all(files.map(f => fs.unlink(path.join(tmpDir, f)).catch(() => {})))
+  }
+}
 
 async function testLiveQuery(profilePath, config) {
   try {
@@ -79,7 +64,7 @@ async function copyFirefoxDatabase(profilePath) {
 
   const files = [
     `${baseName}.sqlite`,
-    `${baseName}.sqlite-wal`, 
+    `${baseName}.sqlite-wal`,
     `${baseName}.sqlite-shm`
   ]
 
@@ -95,23 +80,6 @@ async function copyFirefoxDatabase(profilePath) {
 
   // Return main database path (with matching timestamp)
   return path.join(tmpDir, `yt-history-${timestamp}-${baseName}.sqlite`)
-}
-
-async function copyAndRead(profilePath, config, reason) {
-  const copyPath = path.join(os.tmpdir(), `yt-history-${Date.now()}-${path.basename(profilePath)}`)
-
-  console.log(`  🔒 ${reason}`)
-  await fs.copyFile(profilePath, copyPath)
-  console.log(`  📋 Temp copy: ${copyPath}`)
-
-  try {
-    const cookies = await readCookies(copyPath, config)
-    await fs.unlink(copyPath).catch(() => {})
-    return cookies
-  } catch (error) {
-    await fs.unlink(copyPath).catch(() => {})
-    throw new Error(`Copy failed (${config.name}): ${error.message}`)
-  }
 }
 
 async function readCookies(dbPath, config) {
@@ -131,68 +99,25 @@ async function readCookies(dbPath, config) {
     const db = new Database(dbPath, { readonly: true })
     const rows = db.query(getQuery(config)).all()
     db.close()
+
     console.log(`  📋 ${rows.length} YouTube cookies`)
-    return Object.fromEntries(rows.map(r => [r.name, r.value]))
+
+    // De-dupe by newest expiry
+    const uniqueCookies = rows
+      .reduce((acc, cookie) => {
+        const existing = acc.find(c => c.name === cookie.name)
+        if (!existing || (cookie.expiry || 0) > (existing.expiry || 0)) {
+          return acc.filter(c => c.name !== cookie.name).concat(cookie)
+        }
+        return acc
+      }, [])
+
+    console.log(`  📋 ${uniqueCookies.length} unique cookies`)
+
+    return uniqueCookies  // Array of full cookie objects
   } catch (dbError) {
     throw new Error(`Database read failed: ${dbError.message}`)
   }
-}
-
-function getSAPISIDHASH(sapisid) {
-  const timestamp = Math.floor(Date.now() / 1000).toString()
-  const toSign = `${timestamp} ${sapisid} https://www.youtube.com`
-  const hash = crypto.createHash('sha1').update(toSign).digest('hex')
-  return `SAPISIDHASH ${timestamp}_${hash}`
-}
-
-async function scrapeHistory(cookies) {
-  const cookieStr = Object.entries(cookies)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ')
-  const auth = getSAPISIDHASH(cookies.SAPISID)
-
-  console.log('🌐 Scraping https://www.youtube.com/feed/history...')
-
-  return new Promise(resolve => {
-    const req = https.request(
-      'https://www.youtube.com/feed/history',
-      {
-        method: 'GET',
-        headers: {
-          Cookie: cookieStr,
-          Authorization: auth,
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-          Accept: 'text/html,application/xhtml+xml,*/*;q=0.9',
-          'X-Origin': 'https://www.youtube.com',
-        },
-      },
-      res => {
-        let data = ''
-        res.on('data', chunk => (data += chunk))
-        res.on('end', () => {
-          const $ = cheerio.load(data)
-          const videos = $('#dismissible ytd-video-renderer a#video-title')
-            .slice(0, 30)
-            .map((i, el) => {
-              const href = $(el).attr('href')
-              const idMatch = href?.match(/v=([^&]+)/)
-              return {
-                id: idMatch?.[1],
-                title: $(el).attr('title') || $(el).text()?.trim(),
-                url: href ? `https://youtube.com${href}` : null,
-              }
-            })
-            .get()
-            .filter(v => v.id)
-
-          console.log(`✅ Scraped ${videos.length} recent videos`)
-          resolve(videos)
-        })
-      }
-    )
-    req.on('error', () => resolve([]))
-    req.end()
-  })
 }
 
 async function main() {
@@ -201,14 +126,29 @@ async function main() {
     const selected = await selectDatabase(candidates)
 
     const cookies = await getYoutubeCookies(selected.path, selected.config)
+    console.log()
 
-    if (!cookies.SAPISID) {
+    if (!cookies.find(c => c.name === 'SAPISID')) {
       throw new Error('No cookie named "SAPISID" found. Login to YouTube in your browser and re-run.')
     }
 
-    console.log('Found cookies:', Object.keys(cookies).join(', '))
+    console.log(`📋 ${cookies.length} raw cookies → normalizing...`)
 
-    const videos = await scrapeHistory(cookies)
+    console.debug()
+    console.debug('Cookies:', cookies.map(c=> c.name || 'name missing').join(', '))
+    console.debug()
+    console.debug('First extracted cookie:');
+    console.debug(cookies[0])
+    console.debug()
+
+    const normalizedCookies = normalizeCookies(cookies)
+
+    console.debug()
+    console.debug('First normalized cookie:');
+    console.debug(normalizedCookies[0])
+    console.debug()
+
+    const videos = await scrapeHistory(normalizedCookies)
 
     console.log('\n📺 Recent YouTube videos:')
     console.log(JSON.stringify(videos, null, 2))

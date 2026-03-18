@@ -1,6 +1,7 @@
 {
-  "name": "youtube-history-cli",
+  "name": "yt-history",
   "version": "0.0.0",
+  "description": "Fetches youtube history using your stored browser cookies",
   "type": "module",
   "bin": {
     "yt-history": "./bin/yt-history"
@@ -12,6 +13,6 @@
     "test": "bun test"
   },
   "dependencies": {
-    "cheerio": "1.0.0-rc.12"
+    "puppeteer": "^24.39.1"
   }
 }

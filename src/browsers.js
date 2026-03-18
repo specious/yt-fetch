@@ -1,5 +1,5 @@
 //
-// Declarative browser database locations (extend this)
+// Extendable table of how to find, identify and process different browsers' session databases
 //
 export const BROWSERS = {
   firefox: {
@@ -86,12 +86,20 @@ export const BROWSERS = {
 
 export function getQuery(config) {
   if (!config.table) {
-    throw new Error(`${config.name} ${config.note || 'Not yet supported format'}`)
+    throw new Error(`${config.name}: Not yet supported`)
   }
 
   const operator = config.hostMatch.includes('%') ? 'LIKE' : '='
 
-  return `SELECT name, value FROM ${config.table}
-          WHERE ${config.hostField} ${operator} '${config.hostMatch}'
-          AND name IN ('SAPISID', 'SID', '__Secure-3PSID', 'HSID')`
+  return `SELECT
+            name,
+            value,
+            host AS domain,
+            path,
+            isSecure AS secure,
+            isHttpOnly AS httpOnly,
+            expiry,
+            sameSite
+          FROM ${config.table}
+          WHERE ${config.hostField} ${operator} '${config.hostMatch}'`
 }
