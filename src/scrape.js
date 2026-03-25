@@ -1,126 +1,310 @@
 import puppeteer from 'puppeteer'
+import { dim, bold, c } from './ansi.js'
 
-const sleep = ms => {
-  console.debug('Waiting:', ms)
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
+//
+// The history page (youtube.com/feed/history) exposes per-video (confirmed via DOM inspection):
+//
+//   Field       yt-lockup-view-model (primary, ~95%)     ytd-video-renderer (legacy, ~5%)
+//   ─────────   ──────────────────────────────────────   ──────────────────────────────────
+//   title       h3.yt-lockup-metadata-view-model__       a#video-title
+//               heading-reset
+//   channel     span.yt-content-metadata-view-model__    ytd-channel-name yt-formatted-
+//               metadata-text [0]                        string#text
+//   duration    div.yt-badge-shape__text                 ytd-thumbnail-overlay-time-
+//                                                        status-renderer span#text
+//   views       span.yt-content-metadata-view-model__    span.inline-metadata-item (Shorts only)
+//               metadata-text [1]
+//   isShort     /shorts/ in URL path, or badge text = "SHORTS"
+//
+//   For licensed films, the channel slot contains "Genre • Year" rather than a channel name.
+//
+// Not available in the DOM — we do not attempt to scrape:
+//   - upload date    not rendered on the history feed
+//   - last-watched   never in page HTML; only in Google Takeout watch-history.json
+//
 
-export async function scrapeHistory(cookies, maxVideos = 100) {
-  console.log('Launching a headless browser...')
+const HISTORY_URL = 'https://www.youtube.com/feed/history'
+const SETTLE_MS   = 3000 // Wait after networkidle0 for YouTube's second render pass
+
+function log(msg)   { console.log(`  ${dim('·')}  ${msg}`) }
+function logOk(msg) { console.log(`  ${c.bgreen('✔')}  ${msg}`) }
+
+export async function scrapeHistory(cookies, opts = {}) {
+  const { maxVideos = null, debug = false } = opts
+
+  console.log()
+  console.log(dim('─'.repeat(60)))
+  console.log(`  ${bold('Loading watch history')}`)
+  console.log(dim('─'.repeat(60)))
+  console.log()
+
+  log(`Launching headless browser`)
 
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   })
 
   const context = await browser.createBrowserContext()
-  const page = await context.newPage()
+  const page    = await context.newPage()
 
   try {
-    console.log('\n💉 Injecting', cookies.length, 'cookies...')
-
-    let numInjected = 0
+    //
+    // Inject cookies
+    //
+    let injected = 0, rejected = 0
 
     for (const cookie of cookies) {
-      // Skip invalid (new Puppeteer strictness)
-      if (!cookie.name?.trim() || !cookie.value?.trim()) {
-        console.debug("Skipping cookie:")
-        console.debug(cookie)
-        continue
-      }
-
+      if (!cookie.name?.trim() || !cookie.value?.trim()) continue
       try {
         await context.setCookie(cookie)
-        numInjected++
-      } catch (e) {
-        console.log(`❌ ${cookie.name}: ${e.message}`)
+        injected++
+      } catch {
+        rejected++
       }
     }
 
-    console.log(`✅ ${numInjected}/${cookies.length} cookies injected into the headless browser`)
+    logOk(`${injected} cookies injected${rejected > 0 ? `  ${dim('(' + rejected + ' rejected)')}` : ''}`)
 
-    // Confirm cookie injection
-    const injected = await context.cookies(['https://www.youtube.com'])
-    console.log('🔍 Headless browser sees these YouTube cookies:', injected.map(c => c.name).sort())
-
-    console.info('Loading:', 'https://www.youtube.com/feed/history')
-    await page.goto('https://www.youtube.com/feed/history', {
-      waitUntil: 'networkidle0',
-      timeout: 15000
-    })
-
-    await sleep(1000)
-
-    // Verify logged in state
-    const authState = await page.evaluate(() => ({
-      hasAvatar: !!document.querySelector('#avatar-btn, yt-img-shadow#avatar'),
-      historyLoaded: !!document.querySelector('ytd-history-entry-renderer, #contents ytd-video-renderer'),
-      title: document.title,
-      watchCount: document.querySelectorAll('a[href*="/watch?v="]').length
-    }))
-
-    console.log('📊 Authentication state:', authState)
-
-    if (!authState.historyLoaded) {
-      throw new Error('History not loaded - check auth')
+    if (debug) {
+      const seen = await context.cookies([HISTORY_URL])
+      console.log(`  ${dim('│')}  ${dim('cookies visible to browser:')}`)
+      console.log(`  ${dim('│')}  ${c.ansi256(252)(seen.map(ck => ck.name).sort().join(dim(', ')))}`)
     }
 
-    return await scrollAndExtractVideos(page, maxVideos)
-  } catch (error) {
-    console.error('💥 ERROR:', error.message)
-    await page.screenshot({ path: 'error.png', fullPage: true })
-    throw error
+    //
+    // Navigate to history
+    //
+    log(`Navigating  ${dim(HISTORY_URL)}`)
+
+    await page.goto(HISTORY_URL, { waitUntil: 'networkidle0', timeout: 20_000 })
+
+    // YouTube renders the initial DOM skeleton on networkidle0, then runs a
+    // second JS pass that fills in titles, channels, and metadata. Without
+    // this pause those fields are frequently empty strings.
+    await new Promise(r => setTimeout(r, SETTLE_MS))
+
+    //
+    // Verify "logged in" state
+    //
+    const auth = await page.evaluate(() => ({
+      signedIn:      !!document.querySelector('#avatar-btn, yt-img-shadow#avatar'),
+      historyLoaded: !!document.querySelector('ytd-history-entry-renderer, #contents ytd-video-renderer, yt-lockup-view-model'),
+      title:         document.title,
+    }))
+
+    if (debug) {
+      log(`page title:  ${dim(auth.title)}`)
+      log(`signed in:   ${auth.signedIn ? c.bgreen('yes') : c.bred('no')}`)
+      log(`history DOM: ${auth.historyLoaded ? c.bgreen('found') : c.bred('not found')}`)
+    }
+
+    if (!auth.historyLoaded) {
+      throw new Error(
+        auth.signedIn
+          ? 'History page loaded but no video entries found — try again in a moment.'
+          : 'Not signed in — are the cookies from the right browser and profile?'
+      )
+    }
+
+    if (debug) {
+      // Dump text nodes from the first renderer to help diagnose missing metadata
+      const sample = await page.evaluate(() => {
+        const r = document.querySelector('yt-lockup-view-model, ytd-video-renderer, ytd-history-entry-renderer')
+        if (!r) return null
+        const walker = document.createTreeWalker(r, NodeFilter.SHOW_TEXT)
+        const nodes = []
+        let node
+        while ((node = walker.nextNode())) {
+          const t = node.textContent.trim()
+          if (t) nodes.push({ text: t, tag: node.parentElement?.tagName, id: node.parentElement?.id, cls: [...(node.parentElement?.classList ?? [])].slice(0, 3).join('.') })
+        }
+        return { tag: r.tagName, nodes: nodes.slice(0, 25) }
+      })
+      if (sample) {
+        log(`first renderer: ${dim(sample.tag)}`)
+        for (const n of sample.nodes) {
+          log(`  ${dim(n.tag + (n.id ? '#' + n.id : '') + (n.cls ? '.' + n.cls : ''))}  ${dim(JSON.stringify(n.text))}`)
+        }
+      }
+    }
+
+    //
+    // Extract videos
+    //
+    const videos = await page.evaluate(() => {
+      const seen  = new Map()
+
+      // YouTube video ID: exactly 11 base64url characters
+      const YT_ID_RE = /^[a-zA-Z0-9_-]{11}$/
+
+      // Helper: extract a clean videoId from a URL, or null
+      function extractId(href) {
+        try {
+          const u = new URL(href)
+          const v = u.searchParams.get('v')
+            || u.pathname.match(/\/shorts\/([a-zA-Z0-9_-]{11})/)?.[1]
+          return v && YT_ID_RE.test(v) ? v : null
+        } catch { return null }
+      }
+
+      //
+      // How YouTube history page DOM extraction works
+      // ─────────────────────────────────────────────
+      //
+      // YouTube renders the history feed using Web Components — custom HTML elements
+      // whose tag names start with "ytd-" (legacy) or "yt-" (new component system).
+      // Each video in the history is wrapped in one of these renderer elements, which
+      // act as self-contained components with their own scoped styles and structure.
+      //
+      // As of 2024/2025, two renderer families coexist on the history page:
+      //
+      //   yt-lockup-view-model          ~95% of entries (new system)
+      //   ytd-video-renderer            ~5% of entries (legacy, used for films/shorts)
+      //
+      // We iterate over renderer elements rather than scanning all links on the page.
+      // This is critical: the page also contains sidebar links, related-video panels,
+      // and navigation links — all with /watch?v= URLs — that would pollute results
+      // and win the de-duplication race if we scanned links directly.
+      //
+      // De-duplication: the `seen` Map keyed on videoId prevents the same video from
+      // being added twice. The first occurrence (topmost in DOM = most recently watched)
+      // wins. YouTube IDs are always exactly 11 base64url characters ([A-Za-z0-9_-]{11});
+      // we validate this to reject shelf/section header links that aren't real videos.
+      //
+      // yt-lockup-view-model structure:
+      //
+      //   <yt-lockup-view-model>
+      //     <a class="yt-lockup-view-model__content-image">   ← thumbnail link
+      //       <div class="yt-badge-shape__text">16:00</div>   ← duration badge
+      //     </a>
+      //     <yt-lockup-metadata-view-model>
+      //       <h3 class="yt-lockup-metadata-view-model__heading-reset">
+      //         <a class="yt-lockup-metadata-view-model__title" href="/watch?v=...">
+      //           <span class="yt-core-attributed-string...">Title text</span>
+      //         </a>
+      //       </h3>
+      //       <yt-content-metadata-view-model>
+      //         <span class="yt-content-metadata-view-model__metadata-text">Channel</span>
+      //         <span class="yt-content-metadata-view-model__metadata-text">213K views</span>
+      //       </yt-content-metadata-view-model>
+      //     </yt-lockup-metadata-view-model>
+      //   </yt-lockup-view-model>
+      //
+      // Legacy ytd-video-renderer structure (films, some Shorts):
+      //
+      //   <ytd-video-renderer>
+      //     <ytd-thumbnail>
+      //       <ytd-thumbnail-overlay-time-status-renderer>
+      //         <span id="text">1:46:52</span>               ← duration
+      //       </ytd-thumbnail-overlay-time-status-renderer>
+      //     </ytd-thumbnail>
+      //     <a id="video-title" href="/watch?v=...">Title</a>
+      //     <ytd-channel-name>
+      //       <yt-formatted-string id="text">Channel</yt-formatted-string>
+      //     </ytd-channel-name>
+      //     <div id="metadata-line">
+      //       <span class="inline-metadata-item">27K views</span>
+      //     </div>
+      //   </ytd-video-renderer>
+      //
+      const RENDERER_SEL = [
+        'ytd-video-renderer',
+        'ytd-history-entry-renderer',
+        'ytd-compact-video-renderer',
+        'ytd-grid-video-renderer',
+        'ytd-reel-item-renderer',
+        'ytd-playlist-video-renderer',
+        'yt-lockup-view-model', // new component system (2024+), most history entries
+      ].join(', ')
+
+      for (const renderer of document.querySelectorAll(RENDERER_SEL)) {
+        const isLockup = renderer.tagName.toLowerCase() === 'yt-lockup-view-model'
+
+        let link, title, channel, duration = '', views = ''
+
+        if (isLockup) {
+          //
+          // yt-lockup-view-model — YouTube's new component system (2024+)
+          //
+          // Confirmed selectors from DOM diagnostic:
+          //
+          //   title:    h3.yt-lockup-metadata-view-model__heading-reset
+          //   watchURL: a.yt-lockup-metadata-view-model__title[href]
+          //   duration: div.yt-badge-shape__text  ("16:00", "SHORTS")
+          //   channel:  span.yt-content-metadata-view-model__metadata-text  [0]
+          //   views:    span.yt-content-metadata-view-model__metadata-text  [1]
+          //
+          link  = renderer.querySelector('a.yt-lockup-metadata-view-model__title[href]')
+          title = renderer.querySelector('h3.yt-lockup-metadata-view-model__heading-reset')
+            ?.textContent?.trim() ?? ''
+
+          const rawDur = renderer.querySelector('div.yt-badge-shape__text')
+            ?.textContent?.trim() ?? ''
+          if (rawDur && rawDur !== 'SHORTS') duration = rawDur
+
+          const metaSpans = renderer.querySelectorAll(
+            'span.yt-content-metadata-view-model__metadata-text'
+          )
+          channel = metaSpans[0]?.textContent?.trim() ?? ''
+          views   = metaSpans[1]?.textContent?.trim() ?? ''
+
+        } else {
+          //
+          // Legacy ytd-* renderers — films and some Shorts still use these
+          // Confirmed selectors from DOM diagnostic
+          //
+          link    = renderer.querySelector('a#video-title[href]')
+          title   = link?.textContent?.trim() ?? ''
+          channel = renderer.querySelector('ytd-channel-name yt-formatted-string#text')
+            ?.textContent?.trim() ?? ''
+
+          const raw = renderer
+            .querySelector('ytd-thumbnail-overlay-time-status-renderer span#text')
+            ?.textContent?.trim() ?? ''
+          if (raw && raw !== 'SHORTS') duration = raw
+
+          views = renderer.querySelector('span.inline-metadata-item')
+            ?.textContent?.trim() ?? ''
+        }
+
+        if (!link || !title) continue
+
+        const videoId = extractId(link.href)
+        if (!videoId || seen.has(videoId)) continue
+
+        const isShort = new URL(link.href).pathname.startsWith('/shorts/')
+          || (!duration && renderer.querySelector('div.yt-badge-shape__text')
+              ?.textContent?.trim() === 'SHORTS')
+
+        seen.set(videoId, {
+          videoId, title, channel, duration, views, isShort,
+          url: isShort ? `https://www.youtube.com/shorts/${videoId}` : link.href,
+        })
+      }
+
+      return [...seen.values()]
+    })
+
+    const result = maxVideos != null ? videos.slice(0, maxVideos) : videos
+
+    logOk(
+      `${result.length} video${result.length !== 1 ? 's' : ''} extracted` +
+      (maxVideos != null && videos.length > maxVideos
+        ? `  ${dim(`(${videos.length} found, capped at ${maxVideos})`)}`
+        : '')
+    )
+
+    return result
+
+  } catch (err) {
+    console.error(`  ${c.bred('✖')}  ${err.message}`)
+    const errFile = `yt-history-error-${Date.now()}.png`
+    await page.screenshot({ path: errFile, fullPage: true }).catch(() => {})
+    console.log(`  ${dim('·')}  Screenshot saved to ${dim(errFile)}`)
+    throw err
   } finally {
     await context.close()
     await browser.close()
   }
-}
-
-export async function scrollAndExtractVideos(page, maxVideos = 100) {
-  console.log('📜 Extracting all loaded videos...')
-
-  const allVideos = await page.evaluate(() => {
-    const videos = new Map()
-
-    // Grab all watch links
-    const allLinks = document.querySelectorAll('a[href*="/watch?v="]')
-
-    Array.from(allLinks).forEach(link => {
-      const href = link.href
-      const url = new URL(href)
-      const videoId = url.searchParams.get('v')
-
-      if (!videoId || videos.has(videoId))
-        return
-
-      let titleEl = null
-      let container = null
-
-      // Walk up from the link to find the title container
-      for (let parent = link.parentElement; parent && parent !== document.body; parent = parent.parentElement) {
-        titleEl = parent.querySelector('#video-title, yt-formatted-string, h3[title]')
-
-        if (titleEl?.textContent?.trim()) {
-          container = parent.tagName
-          break
-        }
-      }
-
-      if (titleEl?.textContent?.trim()) {
-        videos.set(videoId, {
-          videoId,
-          title: titleEl.textContent.trim().slice(0, 100),
-          url: href,
-          timestamp: link.closest('[timestamp], .metadata')?.textContent?.trim() || 'N/A',
-          container: container?.toLowerCase() || 'unknown'
-        })
-      }
-    })
-
-    return Array.from(videos.values())
-  })
-
-  console.log(`✅ Extracted ${allVideos.length} unique videos`)
-
-  return allVideos.slice(0, maxVideos)
 }

@@ -1,18 +1,32 @@
 {
-  "name": "yt-history",
-  "version": "0.0.0",
-  "description": "Fetches youtube history using your stored browser cookies",
+  "name": "yt-fetch",
+  "version": "0.1.0",
   "type": "module",
+  "description": "Fetch your personal YouTube watch history using cookies from any installed browser — no API keys, no OAuth.",
+  "license": "ISC",
+  "keywords": [
+    "youtube",
+    "yt",
+    "history",
+    "personal-data",
+    "cookies",
+    "browser",
+    "cli",
+    "bun",
+    "puppeteer"
+  ],
   "bin": {
-    "yt-history": "./bin/yt-history"
+    "yt": "./bin/yt",
+    "patch-bun-on-legacy-macos": "./scripts/install-bun-shim.sh"
   },
   "scripts": {
     "start": "bun src/cli.js",
-    "dev": "bun --watch src/cli.js",
-    "build": "bun build src/cli.js --outdir lib --target node",
-    "test": "bun test"
+    "patch-bun-on-legacy-macos": "bash scripts/install-bun-shim.sh"
   },
   "dependencies": {
     "puppeteer": "^24.39.1"
+  },
+  "engines": {
+    "bun": ">=1.0.14"
   }
 }

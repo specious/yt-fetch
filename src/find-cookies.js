@@ -1,107 +1,114 @@
 import { BROWSERS } from './browsers.js'
-import { Glob } from 'bun'
+import { enrichCandidates } from './select-session.js'
+import { c, dim, bold } from './ansi.js'
+import { Glob } from 'bun' // (requires Bun >= 1.0.14)
 import os from 'os'
 import path from 'path'
+import fs from 'fs/promises'
+import { fileURLToPath } from 'url'
 
-//
-// Expand shell patterns: ~ → home dir, %VAR% → environment variable
-//
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const pkg = JSON.parse(
+  await fs.readFile(path.join(__dirname, '../package.json'), 'utf8')
+)
+
 function expandPath(pattern) {
   return pattern
     .replace(/~/g, os.homedir())
-    .replace(/%([^%]+)%/g, (match, varName) => process.env[varName] || match)
+    .replace(/%([^%]+)%/g, (_, v) => process.env[v] || `%${v}%`)
 }
 
-//
-// Smart cookie database discovery across all configured browsers
-//
-// Returns: Promise<Array<{path, browser, profile, config}>> (found databases)
-//
+// Tilde-relative display path, trailing slash stripped
+function displayPath(absPath) {
+  const home = os.homedir()
+  let p = absPath.startsWith(home) ? '~' + absPath.slice(home.length) : absPath
+  return p.replace(/\/$/, '')
+}
+
 export async function findAllCookies() {
   const results = []
+  const browserOrder = ['firefox', 'chrome', 'brave', 'edge', 'opera', 'safari']
 
-  // Prioritize Firefox first (most reliable)
-  const browserOrder = ['firefox', 'chrome', 'edge', 'opera', 'safari']
+  //
+  // Header
+  //
+  console.log()
+  console.log(`${bold('YouTube Recent Watch History Fetcher')} ${dim('v' + pkg.version)}`)
+  console.log()
+  console.log(dim('─'.repeat(60)))
+  console.log(`  ${bold('Scanning system for browser sessions')}`)
+  console.log(dim('─'.repeat(60)))
 
   for (const id of browserOrder) {
-    const config = BROWSERS[id]
+    const config   = BROWSERS[id]
     if (!config) continue
 
     const patterns = config.profiles[process.platform] || []
     if (patterns.length === 0) continue
 
-    console.log(`🔍 ${config.name} profiles:`)
+    console.log(`\n  ${c.bcyan('◆')} ${bold(config.name)}`)
 
     for (const pattern of patterns) {
-      const base = expandPath(pattern)
-      console.log(`  ${base}`)
+      const base    = expandPath(pattern)
+      const display = displayPath(base)
+      const prefix  = `     ${dim('│')} `
 
       try {
-        const glob = new Glob(`${base}${config.dbName}`)
-        let foundCount = 0
+        const filePath = `${base}${config.dbName}`
 
-        for await (const file of glob.scan()) {
-          foundCount++
-          results.push({
-            path: file,
-            browser: config.name,
-            profile: path.dirname(file),
-            config,
-          })
-        }
+        if (id === 'safari') {
+          // Safari files may be in sandboxed containers that glob can't reach.
+          // Use a direct existence check instead.
+          let exists = false
+          try { await fs.access(filePath); exists = true } catch {}
 
-        if (foundCount === 0) {
-          console.log(`  (none)`)
+          if (exists) {
+            console.log(`${prefix}${c.white(display)}  ${c.yellow('✓ found')}  ${dim('(not yet supported)')}`)
+            // Don't push to results — Safari can't be used yet
+          } else {
+            console.log(`${prefix}${dim(display)}  ${dim('(none)')}`)
+          }
         } else {
-          console.log(`  ✅ ${foundCount} found`)
+          const glob = new Glob(filePath)
+          let found = 0
+
+          for await (const file of glob.scan()) {
+            found++
+            results.push({
+              path:      file,
+              browser:   config.name,
+              profile:   path.dirname(file),
+              config,
+              mtimeMs:   0,
+              sizeBytes: 0,
+              score:     0,
+            })
+          }
+
+          if (found === 0) {
+            console.log(`${prefix}${dim(display)}  ${dim('(none)')}`)
+          } else {
+            console.log(`${prefix}${c.white(display)}  ${c.bgreen(`✓ ${found} found`)}`)
+          }
         }
-      } catch (error) {
-        console.log(`  (not found)`)
+      } catch {
+        console.log(`${prefix}${dim(display)}  ${dim('(none)')}`)
       }
     }
   }
 
-  // TODO: Sort by recency (modification time)
-  // results.sort((a, b) => {
-  //   // Most recently modified first (maybe check fs.stat)
-  //   return 0
-  // })
+  //
+  // Enrich and summarise
+  //
+  await enrichCandidates(results)
 
-  console.log(`\n📊 Total: ${results.length} cookie databases found`)
-  return results
-}
+  const n    = results.length
+  const noun = n === 1 ? 'session' : 'sessions'
 
-//
-// Select best database (Firefox preferred)
-//
-// TODO: Consier: most recently modified, largest file, interactive picker
-//
-export async function selectDatabase(candidates) {
-  if (candidates.length === 0) {
-    throw new Error('No browser cookie databases found')
-  }
-
-  // Prefer Firefox
-  const firefox = candidates.find(c => c.browser.toLowerCase().includes('firefox'))
-  if (firefox && firefox.config.table) {
-    console.log(`\n✅ Firefox auto-selected: ${path.basename(firefox.profile)}`)
-    return firefox
-  }
-
-  console.log(`\n📂 Cookie database candidates:`)
   console.log()
+  console.log(dim('─'.repeat(60)))
+  console.log(`  ${c.byellow('◈')} ${bold(String(n))} browser ${noun} found`)
+  console.log(dim('─'.repeat(60)))
 
-  candidates.forEach((candidate, i) => {
-    const shortPath = path.relative(process.env.HOME || '~', candidate.profile)
-    console.log(`  ${i + 1}. ${candidate.browser} (${shortPath})`)
-  })
-
-  // Non-interactive: use first valid SQLite database
-  const valid = candidates.find(c => c.config.table)
-  if (valid) {
-    console.log(`\n✅ Using: ${valid.browser} (${path.basename(valid.profile)})`)
-    return valid
-  }
-
-  throw new Error('No SQLite-compatible browsers found (Safari needs custom parser)')
+  return results
 }
