@@ -1,4 +1,3 @@
-import puppeteer from 'puppeteer'
 import { dim, bold, c } from './ansi.js'
 
 //
@@ -39,6 +38,15 @@ export async function scrapeHistory(cookies, opts = {}) {
   console.log()
 
   log(`Launching headless browser`)
+
+  let puppeteer
+
+  try {
+    puppeteer = await import('puppeteer')
+  } catch {
+    console.error('\nInstall dependencies with: bun install')
+    process.exit(1)
+  }
 
   const browser = await puppeteer.launch({
     headless: true,
