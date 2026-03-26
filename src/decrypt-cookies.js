@@ -266,9 +266,10 @@ function getDerivedKey(browserName) {
     if (keyCache.has(svc)) return keyCache.get(svc)
 
     const password = getPasswordMacOS(svc, browserName)
-    const derived  = pbkdf2Sync(Buffer.from(password, 'utf8'), SALT, ITERATIONS, KEY_LEN, 'sha1')
-    keyCache.set(svc, derived)
-    return derived
+    const key    = pbkdf2Sync(Buffer.from(password, 'utf8'), SALT, ITERATIONS, KEY_LEN, 'sha1')
+    const result = { key, isBasic: false }
+    keyCache.set(svc, result)
+    return result
   }
 
   // Linux and BSDs both use libsecret / kwallet via the same code path.
@@ -307,6 +308,18 @@ function getDerivedKey(browserName) {
 // Decryption
 //
 
+// Strip the 32-byte SHA256(host_key) domain-binding prefix that newer
+// Chromium versions prepend to the plaintext before encrypting.
+// In basic mode the prefix is always present; in secret-service mode it
+// depends on the browser version.
+function stripPrefix(s) {
+  if (!s || s.length <= 32) return s
+  // Heuristic: if the first 32 chars are non-printable and the rest are
+  // printable, the prefix is present.
+  if (!/^[ -~]{32}/.test(s) && isPrintable(s.slice(32))) return s.slice(32)
+  return s
+}
+
 function tryCBC(key, iv, ct) {
   if (ct.length === 0 || ct.length % 16 !== 0) return null
   try {
@@ -334,28 +347,9 @@ function decryptBlob(encryptedValue, browserName) {
   }
 
   // macOS / Linux / BSD: AES-128-CBC, PBKDF2-derived key
-  const derived = getDerivedKey(browserName)
-
-  // On Linux/BSD getDerivedKey returns { key, isBasic }; on macOS it returns
-  // the raw Buffer directly (no isBasic concept — Keychain always has the key).
-  const key     = derived?.key ?? derived
-  const isBasic = derived?.isBasic ?? false
+  const { key, isBasic } = getDerivedKey(browserName)
 
   const ct = buf.subarray(PREFIX_LEN)  // everything after "v10"/"v11"
-
-  // Helper: strip the 32-byte SHA256(host_key) domain-binding prefix that
-  // newer Chromium versions prepend to the plaintext before encrypting.
-  // In basic mode the prefix is always present. In secret-service mode it
-  // may or may not be, depending on the browser version.
-  function stripPrefix(s) {
-    if (!s) return s
-    // If the first 32 chars are non-printable and the rest are printable,
-    // the 32-byte prefix is present — strip it.
-    if (s.length > 32 && !/^[ -~]{32}/.test(s) && isPrintable(s.slice(32))) {
-      return s.slice(32)
-    }
-    return s
-  }
 
   //
   // Path 1: standard (fixed 16-space IV, full ciphertext)

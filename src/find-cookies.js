@@ -4,13 +4,6 @@ import { c, dim, bold } from './ansi.js'
 import { Glob } from 'bun' // (requires Bun >= 1.0.14)
 import os from 'os'
 import path from 'path'
-import fs from 'fs/promises'
-import { fileURLToPath } from 'url'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const pkg = JSON.parse(
-  await fs.readFile(path.join(__dirname, '../package.json'), 'utf8')
-)
 
 function expandPath(pattern) {
   return pattern
@@ -29,12 +22,6 @@ export async function findAllCookies() {
   const results = []
   const browserOrder = ['firefox', 'chrome', 'brave', 'edge', 'opera', 'safari']
 
-  //
-  // Header
-  //
-  console.log()
-  console.log(`${bold('YouTube Recent Watch History Fetcher')} ${dim('v' + pkg.version)}`)
-  console.log()
   console.log(dim('─'.repeat(60)))
   console.log(`  ${bold('Scanning system for browser sessions')}`)
   console.log(dim('─'.repeat(60)))

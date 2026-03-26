@@ -1,19 +1,16 @@
-import os from 'os'
-import path from 'path'
 import fs from 'fs/promises'
-import { Database } from 'bun:sqlite'
+import path from 'path'
 
 import { c, dim, bold, pad } from './ansi.js'
-import { getQuery } from './browsers.js'
 import { findAllCookies } from './find-cookies.js'
 import { autoSelect, interactivePick, filterCandidates, listCandidates } from './select-session.js'
-import { decryptCookies, isEncryptedBlob, KeychainCancelledError } from './decrypt-cookies.js'
+import { extractCookies } from './extract-cookies.js'
+import { isEncryptedBlob, KeychainCancelledError } from './decrypt-cookies.js'
 import { normalizeCookies } from './normalize-cookies.js'
 import { scrapeHistory } from './scrape.js'
 import { printVideos } from './format-output.js'
-
-const APP_NAME = 'yt-fetch'
-const CLI_NAME = 'yt'
+import { debugSessionStore, debugStage } from './debug.js'
+import { APP_NAME, APP_VERSION, CLI_NAME } from './app.js'
 
 //
 // Argument parsing
@@ -95,14 +92,7 @@ function die(msg) {
 //
 
 async function printVersion() {
-  try {
-    const pkgRaw = await fs.readFile(path.join(process.cwd(), 'package.json'), 'utf8')
-    const pkg = JSON.parse(pkgRaw)
-    const ver = pkg.version ?? '0.0.0'
-    console.log(`${CLI_NAME} ${ver}`)
-  } catch (err) {
-    console.log(`${CLI_NAME} (unknown version)`)
-  }
+  console.log(`${CLI_NAME} ${APP_VERSION}`)
 }
 
 function printHelp() {
@@ -110,7 +100,7 @@ function printHelp() {
   const f = (flag, desc) => `  ${c.bwhite(pad(flag, 26))}  ${dim(desc)}`
 
   console.log(`
-${bold(CLI_NAME)} ${dim('—')} fetch your YouTube watch history via browser cookies
+${bold(CLI_NAME)} ${dim('—')} fetch your YouTube watch history using extracted browser cookies
 
 ${h('Usage:')}
   ${CLI_NAME} [options]
@@ -184,122 +174,6 @@ function printSelected(selected, uniqueCount, skippedCount) {
 // Debug helpers
 //
 
-// Word-wrap a list of cookie names into the debug box width.
-// Continuation lines are indented to align with the first name.
-function wrapNames(names, colWidth, contPad) {
-  const sepW = 2  // visible width of ', '
-  let line   = ''
-  let lineW  = 0
-  const out  = []
-
-  for (let i = 0; i < names.length; i++) {
-    const name   = names[i]
-    const isLast = i === names.length - 1
-    const chunkW = name.length + (isLast ? 0 : sepW)
-
-    if (lineW + chunkW > colWidth && lineW > 0) {
-      out.push(line.trimEnd())
-      line  = contPad
-      lineW = 0
-    }
-    line  += isLast ? name : name + dim(', ')
-    lineW += chunkW
-  }
-  if (line) out.push(line)
-  return out.join('\n')
-}
-
-function debugSessionStore({ source, method, tmpfile, size, sqlite, entries }) {
-  const row = (k, v) => `  ${dim('│')}  ${dim(k.padEnd(9))}  ${dim(v)}`
-
-  console.log(`  ${dim('┌─')} ${c.ansi256(75)(bold('Session store info'))}`)
-  console.log(row('source',  source))
-  if (method && method !== 'live') console.log(row('method',  method))
-  if (tmpfile)                     console.log(row('tmpfile', tmpfile))
-  console.log(row('size',    size))
-  console.log(row('sqlite',  'v' + sqlite))
-  console.log(row('entries', String(entries)))
-  console.log(`  ${dim('└─')}`)
-}
-
-function debugStage(label, cookies) {
-  console.log(`\n  ${dim('┌─')} ${c.ansi256(75)(bold(label))}`)
-
-  // Use terminal width if known, default to 160. Subtract visible prefix '  │  names  ' = 12 chars.
-  const termW   = process.stdout.columns ?? 160
-  const colW    = Math.max(40, termW - 12)
-  // Continuation indent: 2 + │ + 9 spaces = 12 visible chars, aligns with first name
-  const contPad = `  ${dim('│')}         `
-  const nameStr = wrapNames(cookies.map(ck => ck.name), colW, contPad)
-  console.log(`  ${dim('│')}  ${dim('names')}  ${c.ansi256(252)(nameStr)}`)
-
-  if (cookies.length > 0) {
-    console.log(`  ${dim('│')}`)
-    console.log(`  ${dim('│')}  ${dim('first cookie:')}`)
-    console.log(`  ${dim('│')}`)
-    console.log(renderCookie(cookies[0]))
-  }
-
-  console.log(`  ${dim('└─')}`)
-}
-
-function renderCookie(cookie) {
-  const indent = `  ${dim('│')}  `
-  return Object.entries(cookie).map(([k, v]) => {
-    const key = dim(pad(k, 16))
-
-    if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
-      const buf    = Buffer.isBuffer(v) ? v : Buffer.from(v)
-      const prefix = buf.subarray(0, 3).toString('ascii').replace(/[^\x20-\x7e]/g, '?')
-      const hex    = [...buf.subarray(0, 8)].map(b => b.toString(16).padStart(2, '0')).join(' ')
-      const more   = buf.length > 8 ? dim(` …+${buf.length - 8}B`) : ''
-      return `${indent}${key}  ${c.ansi256(208)(prefix)} ${dim(hex)}${more}`
-    }
-
-    if (typeof v === 'string') {
-      if (!v.length) return `${indent}${key}  ${dim('(empty)')}`
-      const isBinary = /[\x00-\x08\x0e-\x1f\x7f-\x9f]/.test(v)
-      const display  = v.slice(0, 72) + (v.length > 72 ? '…' : '')
-      return isBinary
-        ? `${indent}${key}  ${c.bred(display)} ${dim('← still encrypted / binary')}`
-        : `${indent}${key}  ${c.bwhite(display)}`
-    }
-
-    if (typeof v === 'number') {
-      let display = String(v)
-
-      // Expiry formatting
-      if (k === 'expiry' || k === 'expires' || k === 'expires_utc') {
-        display += ' ' + formatExpiryDate(v)
-      }
-
-      return `${indent}${key}  ${c.byellow(display)}`
-    }
-
-    if (typeof v === 'boolean')
-      return `${indent}${key}  ${v ? c.bgreen('true') : dim('false')}`
-
-    if (v == null)
-      return `${indent}${key}  ${dim('—')}`
-
-    return `${indent}${key}  ${dim(String(v))}`
-  }).join('\n')
-}
-
-function formatExpiryDate(rawExpiry) {
-  const v = Number(rawExpiry ?? -1)
-
-  if (v <= 0) return dim('(ephemeral session cookie)')
-
-  // Unified: Chrome micros OR Unix seconds → YYYY-MM-DD
-  const unix = v > 1e15
-    ? Math.floor(v / 1_000_000) - 11644473600  // Chrome → Unix
-    : v  // Already Unix seconds
-
-  const date = new Date(unix * 1000)
-  return dim(`(${date.toISOString().slice(0, 10)})`)
-}
-
 //
 // Pre-flight check
 //
@@ -330,157 +204,6 @@ function diagnoseCookies(cookies) {
   }
 
   return null
-}
-
-//
-// Database helpers
-//
-
-async function copyFirefoxDatabase(dbPath) {
-  const tmpDir = os.tmpdir()
-  const tag    = `${APP_NAME}-${Date.now()}`
-  const dir    = path.dirname(dbPath)
-  const base   = path.basename(dbPath, '.sqlite')
-
-  await Promise.all(
-    ['.sqlite', '.sqlite-wal', '.sqlite-shm'].map(async ext => {
-      try {
-        await fs.copyFile(
-          path.join(dir,    `${base}${ext}`),
-          path.join(tmpDir, `${tag}-${base}${ext}`)
-        )
-      } catch {}
-    })
-  )
-
-  return path.join(tmpDir, `${tag}-${base}.sqlite`)
-}
-
-async function removeTempDatabase(dbPath) {
-  const base = path.basename(dbPath, '.sqlite')
-  await Promise.all(
-    ['.sqlite', '.sqlite-wal', '.sqlite-shm'].map(ext =>
-      fs.unlink(path.join(path.dirname(dbPath), `${base}${ext}`)).catch(() => {})
-    )
-  )
-}
-
-async function canQueryLive(dbPath, config) {
-  try {
-    const db = new Database(dbPath, { readonly: true })
-    db.query(getQuery(config)).all()
-    db.close()
-    return true
-  } catch {
-    return false
-  }
-}
-
-//
-// Cookie extraction
-//
-
-async function extractCookies(selected, opts) {
-  const { path: dbPath, config } = selected
-
-  let workingPath = dbPath
-  let isTempCopy  = false
-  let method      = 'live'
-
-  if (config.alwaysCopy) {
-    workingPath = await copyFirefoxDatabase(dbPath)
-    method      = 'WAL-safe snapshot'
-    isTempCopy  = true
-  } else if (!await canQueryLive(dbPath, config)) {
-    console.log(`  ${dim('·')}  Locked — browser is running, copying database...`)
-    workingPath = path.join(os.tmpdir(), `${APP_NAME}-${Date.now()}-${path.basename(dbPath)}`)
-    await fs.copyFile(dbPath, workingPath)
-    method     = 'copy (locked)'
-    isTempCopy = true
-  }
-
-  try {
-    console.log(`  ${dim('·')}  Extracting cookies from: ${dbPath}`)
-    return await readCookies(workingPath, dbPath, method, config, opts)
-  } finally {
-    if (isTempCopy) await removeTempDatabase(workingPath)
-  }
-}
-
-async function readCookies(dbPath, originalPath, method, config, opts) {
-  const stat   = await fs.stat(dbPath)
-  const sizeKB = (stat.size / 1024).toFixed(0)
-  const sizeMB = (stat.size / 1024 / 1024).toFixed(1)
-
-  const minBytes = config.sizeMin * 1024
-  if (stat.size < minBytes) {
-    throw new Error(
-      `Cookie database is too small (${sizeKB} KB) — ` +
-      `expected at least ${config.sizeMin} KB for a signed-in ${config.name} session.\n` +
-      `  → Make sure you are signed in to YouTube in ${config.name} and re-run.`
-    )
-  }
-
-  const db        = new Database(dbPath, { readonly: true })
-  const sqliteVer = db.query('select sqlite_version() as v').get()?.v ?? '?'
-  const rows      = db.query(getQuery(config)).all()
-  db.close()
-
-  if (opts.debug) {
-    console.log()
-    debugSessionStore({
-      source:  originalPath,
-      method,
-      tmpfile: method !== 'live' ? dbPath : null,
-      size:    `${sizeMB}MB (${sizeKB}KB)`,
-      sqlite:  sqliteVer,
-      entries: rows.length,
-    })
-    debugStage(`SQLite ${sqliteVer} — ${rows.length} cookie entries`, rows)
-    console.log()
-  }
-
-  if (rows.length === 0) {
-    throw new Error(
-      `No cookies found in this session store.\n\n` +
-      `  → Make sure you have visited YouTube in this ${config.name} profile and are signed in, then re-run.\n` +
-      `  → Or use -i to pick a different session.`
-    )
-  }
-
-  // De‑duplicate: keep the entry with the furthest expiry for each cookie name
-  const seen = new Map()
-  for (const entry of rows) {
-    const prev = seen.get(entry.name)
-    if (!prev || (entry.expiry || 0) > (prev.expiry || 0)) seen.set(entry.name, entry)
-  }
-  const unique = [...seen.values()]
-
-  // Chromium-family: decrypt only when value is empty and encryptedValue looks like a blob
-  const toDecrypt = unique.filter(
-    ck => (ck.value === '' || ck.value == null) && isEncryptedBlob(ck.encryptedValue)
-  )
-
-  if (toDecrypt.length === 0) {
-    if (opts.verbose) {
-      console.log(`  ${dim('·')}  None of the cookies require decryption`)
-    }
-  } else {
-    decryptCookies(toDecrypt, config.name)
-
-    if (opts.debug) {
-      debugStage(`after decryption — ${unique.length} cookies`, unique)
-      console.log()
-    }
-
-    if (opts.verbose) {
-      const successCount = toDecrypt.filter(c => c.value && c.value.length > 0).length
-      const successRate = ((successCount / toDecrypt.length) * 100).toFixed(0)
-      console.log(`  ${dim('·')}  ${successCount}/${toDecrypt.length} cookies decrypted (${successRate}%)`)
-    }
-  }
-
-  return { cookies: unique, uniqueCount: unique.length }
 }
 
 //
@@ -521,6 +244,10 @@ async function main() {
 
   if (opts.quiet) muteOutput()
 
+  console.log()
+  console.log(`${bold('YouTube Recent Watch History Fetcher')} ${dim('v' + APP_VERSION)}`)
+  console.log()
+
   try {
     const allCandidates = await findAllCookies()
 
@@ -544,6 +271,13 @@ async function main() {
       : autoSelect(candidates)
 
     const extracted = await extractCookies(selected, opts)
+
+    if (opts.debug) {
+      console.log()
+      debugSessionStore(extracted)
+      debugStage(`SQLite ${extracted.sqliteVer} — ${extracted.entryCount} entries`, extracted.cookies)
+      console.log()
+    }
 
     if (opts.verbose) {
       console.log(`  ${dim('·')}  Normalizing cookies`)
