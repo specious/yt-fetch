@@ -22,61 +22,91 @@ const VALID_SORTS      = ['asc', 'desc']
 
 function parseArgs(argv) {
   const args = argv.slice(2)
+
+  // Define option specifications for easy extension
+  const optionSpecs = [
+    { flags: ['-i', '--interactive'], type: 'boolean', key: 'interactive' },
+    { flags: ['-l', '--list'], type: 'boolean', key: 'list' },
+    { flags: ['-v', '--verbose'], type: 'boolean', key: 'verbose' },
+    { flags: ['-q', '--quiet'], type: 'boolean', key: 'quiet' },
+    { flags: ['-h', '--help'], type: 'boolean', key: 'help' },
+    { flags: ['--debug'], type: 'boolean', key: 'debug', sideEffect: opts => opts.verbose = true },
+    { flags: ['--version'], type: 'boolean', key: 'version' },
+    { flags: ['--dry-run'], type: 'boolean', key: 'dryRun' },
+    { flags: ['-b', '--browser'], type: 'string', key: 'browser' },
+    { flags: ['-p', '--profile'], type: 'string', key: 'profile' },
+    { flags: ['-n', '--max'], type: 'int', key: 'maxVideos', validator: v => v > 0 ? v : die(`Invalid max videos: ${v} (must be a positive integer)`) },
+    { flags: ['-o', '--output'], type: 'enum', key: 'output', values: VALID_OUTPUTS },
+    { flags: ['--video-url'], type: 'enum', key: 'urlStyle', values: VALID_URL_STYLES },
+    { flags: ['--sort'], type: 'enum', key: 'sort', values: VALID_SORTS },
+  ]
+
   const opts = {
-    interactive:  false,
-    list:         false,
-    browser:      null,
-    profile:      null,
-    maxVideos:    null,
-    output:       'pretty',   // pretty | json | yaml
-    urlStyle:     'short',    // short | canonical
-    sort:         'asc',      // asc | desc
-    verbose:      false,
-    debug:        false,
-    quiet:        false,
-    dryRun:       false,
-    help:         false,
-    version:      false,
+    interactive: false,
+    list: false,
+    browser: null,
+    profile: null,
+    maxVideos: null,
+    output: 'pretty',
+    urlStyle: 'short',
+    sort: 'asc',
+    verbose: false,
+    debug: false,
+    quiet: false,
+    dryRun: false,
+    help: false,
+    version: false,
   }
 
+  const unknownArgs = []
+
   for (let i = 0; i < args.length; i++) {
-    const a = args[i]
-    switch (a) {
-      case '-i': case '--interactive':  opts.interactive  = true; break
-      case '-l': case '--list':         opts.list         = true; break
-      case '-v': case '--verbose':      opts.verbose      = true; break
-      case '-q': case '--quiet':        opts.quiet        = true; break
-      case '-h': case '--help':         opts.help         = true; break
-      case '--debug':                   opts.debug        = true; opts.verbose = true; break
-      case '--version':                 opts.version      = true; break
-      case '--dry-run':                 opts.dryRun       = true; break
+    const arg = args[i]
+    let key = arg
+    let value = null
 
-      case '-b': case '--browser': opts.browser   = args[++i]; break
-      case '-p': case '--profile': opts.profile   = args[++i]; break
-      case '-n': case '--max':     opts.maxVideos = parseInt(args[++i]) || null; break
-
-      case '-o': case '--output': {
-        const v = args[++i]
-        if (!VALID_OUTPUTS.includes(v)) die(`Unknown output format: ${bold(v)}  (valid: ${VALID_OUTPUTS.join(', ')})`)
-        opts.output = v
-        break
-      }
-      case '--video-url': {
-        const v = args[++i]
-        if (!VALID_URL_STYLES.includes(v)) die(`Unknown URL style: ${bold(v)}  (valid: ${VALID_URL_STYLES.join(', ')})`)
-        opts.urlStyle = v
-        break
-      }
-      case '--sort': {
-        const v = args[++i]
-        if (!VALID_SORTS.includes(v)) die(`Unknown sort order: ${bold(v)}  (valid: ${VALID_SORTS.join(', ')})`)
-        opts.sort = v
-        break
-      }
-
-      default:
-        console.warn(c.yellow(`  ⚠  Unknown argument: ${a}`) + dim('  (--help for usage)'))
+    // Handle --option=value
+    if (arg.startsWith('--') && arg.includes('=')) {
+      [key, value] = arg.split('=', 2)
     }
+
+    const spec = optionSpecs.find(s => s.flags.includes(key))
+    if (!spec) {
+      unknownArgs.push(arg)
+      continue
+    }
+
+    if (spec.type === 'boolean') {
+      opts[spec.key] = true
+      if (spec.sideEffect) spec.sideEffect(opts)
+    } else {
+      // Requires value
+      let val
+      if (value !== null) {
+        val = value
+      } else {
+        if (++i >= args.length) die(`Missing value for ${key}`)
+        val = args[i]
+      }
+
+      if (spec.type === 'int') {
+        const num = parseInt(val, 10)
+        if (isNaN(num)) die(`Invalid integer for ${key}: ${val}`)
+        val = num
+      }
+
+      if (spec.validator) {
+        val = spec.validator(val)
+      } else if (spec.values && !spec.values.includes(val)) {
+        die(`Unknown ${spec.key}: ${bold(val)} (valid: ${spec.values.join(', ')})`)
+      }
+
+      opts[spec.key] = val
+    }
+  }
+
+  if (unknownArgs.length > 0) {
+    die(`Unknown arguments: ${unknownArgs.join(', ')} (use --help for usage)`)
   }
 
   return opts
