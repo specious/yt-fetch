@@ -3,16 +3,15 @@ import { dim, bold, c } from './ansi.js'
 //
 // The history page (youtube.com/feed/history) exposes per-video (confirmed via DOM inspection):
 //
-//   Field       yt-lockup-view-model (primary, ~95%)     ytd-video-renderer (legacy, ~5%)
-//   ─────────   ──────────────────────────────────────   ──────────────────────────────────
-//   title       h3.yt-lockup-metadata-view-model__       a#video-title
-//               heading-reset
-//   channel     span.yt-content-metadata-view-model__    ytd-channel-name yt-formatted-
-//               metadata-text [0]                        string#text
-//   duration    div.yt-badge-shape__text                 ytd-thumbnail-overlay-time-
-//                                                        status-renderer span#text
-//   views       span.yt-content-metadata-view-model__    span.inline-metadata-item (Shorts only)
-//               metadata-text [1]
+//   Field       yt-lockup-view-model (primary, ~95%)      ytd-video-renderer (legacy, ~5%)
+//   ─────────   ──────────────────────────────────────    ──────────────────────────────────
+//   title       h3.ytLockupMetadataViewModelHeadingReset  a#video-title
+//   channel     span.ytContentMetadataViewModelMetadata   ytd-channel-name yt-formatted-
+//               Text [0]                                  string#text
+//   duration    div.ytBadgeShapeText                      ytd-thumbnail-overlay-time-
+//                                                         status-renderer span#text
+//   views       span.ytContentMetadataViewModelMetadata   span.inline-metadata-item (Shorts only)
+//               Text [1]
 //   isShort     /shorts/ in URL path, or badge text = "SHORTS"
 //
 //   For licensed films, the channel slot contains "Genre • Year" rather than a channel name.
@@ -22,8 +21,10 @@ import { dim, bold, c } from './ansi.js'
 //   - last-watched   never in page HTML; only in Google Takeout watch-history.json
 //
 
-const HISTORY_URL = 'https://www.youtube.com/feed/history'
-const SETTLE_MS   = 3000 // Wait after networkidle0 for YouTube's second render pass
+const HISTORY_URL  = 'https://www.youtube.com/feed/history'
+const SETTLE_MS    = 3000  // Wait after networkidle0 for YouTube's second render pass
+const SCROLL_MS    = 1500  // Wait after each scroll for YouTube to render new items
+const SCROLL_STALL = 3     // Stop after this many scrolls with no new items
 
 function log(msg)   { console.log(`  ${dim('·')}  ${msg}`) }
 function logOk(msg) { console.log(`  ${c.bgreen('✔')}  ${msg}`) }
@@ -115,6 +116,56 @@ export async function scrapeHistory(cookies, opts = {}) {
       )
     }
 
+    //
+    // Scroll to load the full history (YouTube uses infinite scroll)
+    //
+    // The history feed renders ~10-15 items initially, then appends more as
+    // the user scrolls. We scroll to the bottom repeatedly, waiting for the
+    // DOM to settle between each pass, stopping when two consecutive scrolls
+    // produce no new renderer elements or when maxVideos have been loaded.
+    //
+    const RENDERER_COUNT_SEL = [
+      'ytd-video-renderer',
+      'ytd-history-entry-renderer',
+      'ytd-compact-video-renderer',
+      'ytd-grid-video-renderer',
+      'ytd-reel-item-renderer',
+      'ytd-playlist-video-renderer',
+      'yt-lockup-view-model',
+    ].join(', ')
+
+    let prevCount = 0, stalls = 0, scrollPass = 0
+
+    while (stalls < SCROLL_STALL) {
+      const count = await page.evaluate(
+        sel => document.querySelectorAll(sel).length,
+        RENDERER_COUNT_SEL
+      )
+
+      if (maxVideos != null && count >= maxVideos) break
+
+      if (count > prevCount) {
+        log(`Scrolling  ${dim(`${count} items so far…`)}`)
+        stalls = 0
+        prevCount = count
+      } else {
+        stalls++
+      }
+
+      if (stalls >= SCROLL_STALL) break
+
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+      await new Promise(r => setTimeout(r, SCROLL_MS))
+      scrollPass++
+    }
+
+    const finalCount = await page.evaluate(
+      sel => document.querySelectorAll(sel).length,
+      RENDERER_COUNT_SEL
+    )
+
+    log(`Scroll complete  ${dim(`${finalCount} renderer elements in DOM`)}`)
+
     if (debug) {
       // Dump text nodes from the first renderer to help diagnose missing metadata
       const sample = await page.evaluate(() => {
@@ -183,18 +234,18 @@ export async function scrapeHistory(cookies, opts = {}) {
       // yt-lockup-view-model structure:
       //
       //   <yt-lockup-view-model>
-      //     <a class="yt-lockup-view-model__content-image">   ← thumbnail link
-      //       <div class="yt-badge-shape__text">16:00</div>   ← duration badge
+      //     <a class="ytLockupViewModelContentImage">          ← thumbnail link
+      //       <div class="ytBadgeShapeText">16:00</div>        ← duration badge
       //     </a>
       //     <yt-lockup-metadata-view-model>
-      //       <h3 class="yt-lockup-metadata-view-model__heading-reset">
-      //         <a class="yt-lockup-metadata-view-model__title" href="/watch?v=...">
-      //           <span class="yt-core-attributed-string...">Title text</span>
+      //       <h3 class="ytLockupMetadataViewModelHeadingReset">
+      //         <a class="ytLockupMetadataViewModelTitle" href="/watch?v=...">
+      //           <span class="ytAttributedStringHost...">Title text</span>
       //         </a>
       //       </h3>
       //       <yt-content-metadata-view-model>
-      //         <span class="yt-content-metadata-view-model__metadata-text">Channel</span>
-      //         <span class="yt-content-metadata-view-model__metadata-text">213K views</span>
+      //         <span class="ytContentMetadataViewModelMetadataText">Channel</span>
+      //         <span class="ytContentMetadataViewModelMetadataText">213K views</span>
       //       </yt-content-metadata-view-model>
       //     </yt-lockup-metadata-view-model>
       //   </yt-lockup-view-model>
@@ -204,7 +255,7 @@ export async function scrapeHistory(cookies, opts = {}) {
       //   <ytd-video-renderer>
       //     <ytd-thumbnail>
       //       <ytd-thumbnail-overlay-time-status-renderer>
-      //         <span id="text">1:46:52</span>               ← duration
+      //         <span id="text">1:46:52</span>                 ← duration
       //       </ytd-thumbnail-overlay-time-status-renderer>
       //     </ytd-thumbnail>
       //     <a id="video-title" href="/watch?v=...">Title</a>
@@ -235,27 +286,25 @@ export async function scrapeHistory(cookies, opts = {}) {
           //
           // yt-lockup-view-model — YouTube's new component system (2024+)
           //
-          // Confirmed selectors from DOM diagnostic:
+          // Class names: camelCase (current) with kebab-case BEM fallbacks for older renders.
           //
-          //   title:    h3.yt-lockup-metadata-view-model__heading-reset
-          //   watchURL: a.yt-lockup-metadata-view-model__title[href]
-          //   duration: div.yt-badge-shape__text  ("16:00", "SHORTS")
-          //   channel:  span.yt-content-metadata-view-model__metadata-text  [0]
-          //   views:    span.yt-content-metadata-view-model__metadata-text  [1]
+          //   title:    h3.ytLockupMetadataViewModelHeadingReset
+          //   watchURL: a.ytLockupMetadataViewModelTitle[href]
+          //   duration: div.ytBadgeShapeText  ("16:00", "SHORTS")
+          //   channel:  span.ytContentMetadataViewModelMetadataText  [0]
+          //   views:    span.ytContentMetadataViewModelMetadataText  [1]
           //
-          link  = renderer.querySelector('a.yt-lockup-metadata-view-model__title[href]')
-          title = renderer.querySelector('h3.yt-lockup-metadata-view-model__heading-reset')
+          link  = renderer.querySelector('a.ytLockupMetadataViewModelTitle[href]')
+          title = renderer.querySelector('h3.ytLockupMetadataViewModelHeadingReset')
             ?.textContent?.trim() ?? ''
 
-          const rawDur = renderer.querySelector('div.yt-badge-shape__text')
+          const rawDur = renderer.querySelector('div.ytBadgeShapeText')
             ?.textContent?.trim() ?? ''
           if (rawDur && rawDur !== 'SHORTS') duration = rawDur
 
-          const metaSpans = renderer.querySelectorAll(
-            'span.yt-content-metadata-view-model__metadata-text'
-          )
-          channel = metaSpans[0]?.textContent?.trim() ?? ''
-          views   = metaSpans[1]?.textContent?.trim() ?? ''
+          const spans = renderer.querySelectorAll('span.ytContentMetadataViewModelMetadataText')
+          channel = spans[0]?.textContent?.trim() ?? ''
+          views   = spans[1]?.textContent?.trim() ?? ''
 
         } else {
           //
@@ -282,7 +331,7 @@ export async function scrapeHistory(cookies, opts = {}) {
         if (!videoId || seen.has(videoId)) continue
 
         const isShort = new URL(link.href).pathname.startsWith('/shorts/')
-          || (!duration && renderer.querySelector('div.yt-badge-shape__text')
+          || (!duration && renderer.querySelector('div.ytBadgeShapeText')
               ?.textContent?.trim() === 'SHORTS')
 
         seen.set(videoId, {
