@@ -312,19 +312,26 @@ function getDerivedKey(browserName) {
 // Chromium versions prepend to the plaintext before encrypting.
 // In basic mode the prefix is always present; in secret-service mode it
 // depends on the browser version.
-function stripPrefix(s) {
-  if (!s || s.length <= 32) return s
-  // Heuristic: if the first 32 chars are non-printable and the rest are
-  // printable, the prefix is present.
-  if (!/^[ -~]{32}/.test(s) && isPrintable(s.slice(32))) return s.slice(32)
-  return s
+//
+// Must operate on a raw Buffer, not a UTF-8 string: the 32-byte SHA256 hash
+// can contain byte pairs that form valid multi-byte UTF-8 sequences, making
+// the resulting JS string shorter than 32 characters. Slicing at char index 32
+// then cuts one or more bytes into the actual cookie value.
+function stripPrefixBuffer(buf) {
+  if (!buf || buf.length <= 32) return buf
+  // latin1 is a 1:1 byte→char mapping, giving a reliable 32-char prefix check.
+  if (!/^[ -~]{32}/.test(buf.subarray(0, 32).toString('latin1'))
+      && isPrintable(buf.subarray(32).toString('utf8'))) {
+    return buf.subarray(32)
+  }
+  return buf
 }
 
 function tryCBC(key, iv, ct) {
   if (ct.length === 0 || ct.length % 16 !== 0) return null
   try {
     const d = createDecipheriv('aes-128-cbc', key, iv)
-    return Buffer.concat([d.update(ct), d.final()]).toString('utf8')
+    return Buffer.concat([d.update(ct), d.final()])
   } catch {
     return null
   }
@@ -354,10 +361,11 @@ function decryptBlob(encryptedValue, browserName) {
   //
   // Path 1: standard (fixed 16-space IV, full ciphertext)
   //
-  const standard = tryCBC(key, STANDARD_IV, ct)
-  if (standard !== null) {
-    const v = isBasic ? stripPrefix(standard) : standard
-    if (v !== null && isPrintable(v)) return v
+  const standardBuf = tryCBC(key, STANDARD_IV, ct)
+  if (standardBuf !== null) {
+    const stripped = isBasic ? stripPrefixBuffer(standardBuf) : standardBuf
+    const v = stripped.toString('utf8')
+    if (isPrintable(v)) return v
   }
 
   //
@@ -369,15 +377,21 @@ function decryptBlob(encryptedValue, browserName) {
   if (ct.length >= 48) {
     const nonceIV = ct.subarray(16, 32)  // CT_nonce2 = blob[19:35]
     const valueCT = ct.subarray(32)      // CT_value  = blob[35:]
-    const nonce   = tryCBC(key, nonceIV, valueCT)
-    if (nonce !== null) {
-      const v = isBasic ? stripPrefix(nonce) : nonce
-      if (v !== null && isPrintable(v)) return v
+    const nonceBuf = tryCBC(key, nonceIV, valueCT)
+    if (nonceBuf !== null) {
+      const stripped = isBasic ? stripPrefixBuffer(nonceBuf) : nonceBuf
+      const v = stripped.toString('utf8')
+      if (isPrintable(v)) return v
     }
   }
 
   // Return stripped standard result even if not printable — caller handles bad values
-  return isBasic ? stripPrefix(standard) : standard
+  if (standardBuf !== null) {
+    const stripped = isBasic ? stripPrefixBuffer(standardBuf) : standardBuf
+    return stripped.toString('utf8')
+  }
+
+  return null
 }
 
 //

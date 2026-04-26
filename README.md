@@ -4,15 +4,12 @@ Fetch your personal YouTube watch history **without API keys, OAuth, or manual c
 
 `yt-fetch` discovers signed-in browser sessions on your machine, decrypts cookies locally, and uses a headless browser to load YouTube just like a real user session. It currently focuses on recent watch history and related metadata, with plans to expand to other personal data.
 
-> ⚠️ **Early-stage project**
-> This tool is actively evolving. It works across many setups, but not all. Expect rough edges, platform quirks, and breaking changes as coverage improves.
-
 ## Features
 
 - Automatically detects installed browsers and profiles
 - Decrypts cookies locally
   - Firefox: plaintext
-  - Chromium: AES‑GCM (Keychain, Secret Service, DPAPI)
+  - Chromium: AES-128-CBC (macOS Keychain, Linux libsecret/kwallet/basic, Windows DPAPI)
 - Selects the best available signed-in session automatically (without `-i`)
 - Lets you choose which browser session to use (with `-i`)
 - Fetches data using headless browsing using injected cookies
@@ -85,23 +82,30 @@ Output formats: `pretty` (default), `json`, `yaml`
 
 ## Browser Support
 
-> Coverage varies. “Known working” means tested; others may still work with caveats.
+> “Known working” means tested end-to-end. Others may work but haven't been verified on that platform yet.
 
 | Browser | macOS | Linux | Windows |
 |---|---:|---:|---:|
 | Firefox | ✅ Known working | ✅ Known working | ✅ Known working |
-| Chrome / Brave / Edge | ✅ Works (Keychain) | ⚠️ Partial | ⚠️ Partial |
-| Opera | ✅ Works (Keychain) | ⚠️ Partial | ⚠️ Partial |
+| Chrome / Brave / Edge | ✅ Known working | ✅ Known working | ⚠️ Untested |
+| Opera | ✅ Known working | ✅ Known working | ⚠️ Untested |
 | Safari | 🚧 Planned | — | — |
 | Chrome 127+ (Win v20) | — | — | ❌ Not supported |
 
+**Linux notes**
+
+Chromium-based browsers encrypt cookies using whichever secret store was available at first launch:
+
+- **GNOME Keyring** (libsecret) — queried automatically, no prompt
+- **KWallet** — queried automatically via `kwallet-query`
+- **No keyring** (basic mode) — cookies are encrypted with a fixed fallback key; works without any keyring daemon
+
+All three paths are supported. Firefox always uses plaintext cookies and needs no keyring at all.
+
 ### Known Issues
 
-- Some Chromium sessions appear signed out after cookie injection
-- Keyring prompts can interrupt automation
-- Puppeteer/Chromium may fail on older macOS versions
-
-These are under active investigation.
+- Keyring prompts can interrupt automation on macOS
+- Puppeteer/Chromium may fail on older macOS versions (see below)
 
 ## Diagnostics
 
@@ -178,14 +182,13 @@ At the moment, this is as far as the tool can go on older macOS systems until a 
 
 ### In Progress
 
-- Improve Linux reliability (keyrings, different encryption behavior, distro nuances)
+- Windows testing — native and WSL
 - Better session validation before launching Puppeteer
-- Clearer debug output and error messages
 
 ### Under Consideration
 
 - Additional data types: likes, playlists, subscriptions, etc.
-- Improved Windows support for newer Chromium cookie formats
+- Safari support (BinaryCookies format parser)
 
 ### Ecosystem Direction
 

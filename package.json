@@ -1,6 +1,6 @@
 {
   "name": "yt-fetch",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Fetch your personal YouTube watch history using cookies from any installed browser — no API keys, no OAuth",
   "license": "ISC",
@@ -24,7 +24,7 @@
     "patch-bun-on-legacy-macos": "bash scripts/install-bun-shim.sh"
   },
   "dependencies": {
-    "puppeteer": "^24.39.1"
+    "puppeteer": "^24.42.0"
   },
   "engines": {
     "bun": ">=1.0.14"
