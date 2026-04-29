@@ -1,11 +1,12 @@
 import fs from 'fs/promises'
+import os from 'os'
 import path from 'path'
 
 import { c, dim, bold, pad } from './ansi.js'
 import { findAllCookies } from './find-cookies.js'
 import { autoSelect, interactivePick, filterCandidates, listCandidates } from './select-session.js'
 import { extractCookies } from './extract-cookies.js'
-import { isEncryptedBlob, KeychainCancelledError } from './decrypt-cookies.js'
+import { isEncryptedBlob, KeychainCancelledError, getV20Count } from './decrypt-cookies.js'
 import { normalizeCookies } from './normalize-cookies.js'
 import { scrapeHistory } from './scrape.js'
 import { printVideos } from './format-output.js'
@@ -23,7 +24,6 @@ const VALID_SORTS      = ['asc', 'desc']
 function parseArgs(argv) {
   const args = argv.slice(2)
 
-  // Define option specifications for easy extension
   const optionSpecs = [
     { flags: ['-i', '--interactive'], type: 'boolean', key: 'interactive' },
     { flags: ['-l', '--list'], type: 'boolean', key: 'list' },
@@ -172,9 +172,11 @@ ${h('Examples:')}
 function printSelected(selected, uniqueCount, skippedCount) {
   const { browser, profile, config, sizeBytes, mtimeMs } = selected
 
-  const home   = process.env.HOME ?? os.homedir()
-  const relDir = path.relative(home, path.dirname(profile))
-  const leaf   = path.basename(profile)
+  const home    = os.homedir().replace(/\\/g, '/')
+  const profFwd = profile.replace(/\\/g, '/')
+  const dir     = profFwd.slice(0, profFwd.lastIndexOf('/'))
+  const leaf    = profFwd.slice(profFwd.lastIndexOf('/') + 1)
+  const relDir  = dir.startsWith(home) ? dir.slice(home.length + 1) : dir
 
   const sizeStr = sizeBytes >= 1024 * 1024
     ? `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`
@@ -201,10 +203,6 @@ function printSelected(selected, uniqueCount, skippedCount) {
 }
 
 //
-// Debug helpers
-//
-
-//
 // Pre-flight check
 //
 
@@ -225,6 +223,7 @@ function diagnoseCookies(cookies) {
     )
   }
 
+  // SAPISID is Google's primary signed-in session cookie — no SAPISID means no active login
   if (!cookies.find(ck => ck.name === 'SAPISID')) {
     return (
       'No SAPISID cookie — YouTube session not found in this profile.\n' +
@@ -309,6 +308,12 @@ async function main() {
       console.log()
     }
 
+    // If every cookie failed to decrypt and the cause is v20 app-bound encryption,
+    // exit cleanly — the warning + next-step hint was already printed by decryptCookies.
+    const v20 = getV20Count(selected.config.name)
+    const anyValue = extracted.cookies.some(c => c.value && c.value.length > 0)
+    if (!anyValue && v20 > 0) process.exit(0)
+
     if (opts.verbose) {
       console.log(`  ${dim('·')}  Normalizing cookies`)
     }
@@ -327,7 +332,7 @@ async function main() {
 
     console.log(`  ${c.bgreen('✔')}  ${cookies.length} cookies prepared for injection`)
 
-    if (opts.debug) debugStage(`after normalization — ${cookies.length} cookies`, cookies)
+    if (opts.debug) debugStage(`After normalization — ${cookies.length} cookies`, cookies)
 
     // Pre-flight: diagnose before launching Puppeteer to avoid a wasted ~5s startup
     const problem = diagnoseCookies(cookies)

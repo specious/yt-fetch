@@ -1,6 +1,7 @@
 import fs from 'fs/promises'
 import os from 'os'
 import path from 'path'
+
 import { c, dim, bold, italic, pad, strip } from './ansi.js'
 
 //
@@ -36,12 +37,16 @@ function browserScore(candidate) {
   return 20
 }
 
+// Exponential decay: today scores 40, halves every RECENCY_HALF_LIFE_DAYS days.
+// A session untouched for 3 half-lives (~21 days) contributes only 5 pts.
 function recencyScore(candidate) {
   if (!candidate.mtimeMs) return 0
   const ageDays = (Date.now() - candidate.mtimeMs) / 86_400_000
   return Math.round(40 * Math.pow(0.5, ageDays / RECENCY_HALF_LIFE_DAYS))
 }
 
+// 4 pts/MB, capped at 20 (≥5 MB). A larger cookie database is a proxy for
+// an actively used profile with a richer session store.
 function sizeScore(candidate) {
   const mb = (candidate.sizeBytes ?? 0) / (1024 * 1024)
   return Math.min(20, Math.round(mb * 4))
@@ -79,24 +84,26 @@ function scoreBar(score, maxScore = 160, width = 8) {
   return dim('[') + colored + dim(']')
 }
 
-// Tilde-relative profile path with the leaf directory highlighted
+// Tilde-relative profile path with the leaf directory highlighted.
+// Uses forward slashes throughout — profile paths are stored with forward
+// slashes from the glob, and os.homedir() on Windows uses backslashes which
+// would break the startsWith comparison and the subsequent split.
 function formatProfilePath(candidate) {
-  const home = process.env.HOME || os.homedir()
-  const rel  = candidate.profile.startsWith(home)
-    ? '~' + candidate.profile.slice(home.length)
-    : candidate.profile
+  const home    = os.homedir().replace(/\\/g, '/')
+  const profile = candidate.profile.replace(/\\/g, '/')
+  const rel     = profile.startsWith(home) ? '~' + profile.slice(home.length) : profile
 
-  const parts = rel.split(path.sep)
-  const leaf  = parts.pop()
-  const dir   = parts.join(path.sep)
+  const slash = rel.lastIndexOf('/')
+  const dir   = rel.slice(0, slash + 1)  // includes trailing slash
+  const leaf  = rel.slice(slash + 1)
 
-  return `${dim(dir + path.sep)}${c.white(leaf)}`
+  return `${dim(dir)}${c.white(leaf)}`
 }
 
 // One-line summary for a candidate — used in both list and picker views
-function candidateLine(candidate, { showScore = false, index = null, isDefault = false } = {}) {
+function candidateLine(candidate, { showScore = false, index = null, isDefault = false, browserWidth = 20 } = {}) {
   const num     = index != null ? dim(`${String(index + 1).padStart(2)}.`) + ' ' : '   '
-  const browser = pad(bold(candidate.browser), 20)
+  const browser = pad(bold(candidate.browser), browserWidth)
   const profile = formatProfilePath(candidate)
   const meta    = dim(`${formatSize(candidate.sizeBytes)}, ${formatAgo(Date.now() - (candidate.mtimeMs || 0))}`)
   const bar     = showScore ? '  ' + scoreBar(candidate.score) : ''
@@ -145,7 +152,6 @@ export function autoSelect(candidates) {
   const why     = reasons ? `  ${dim('(' + reasons + ')')}` : ''
   console.log()
   console.log(`  ${c.bgreen('✔')} ${bold('Selected:')} ${bold(winner.browser)}${why}`)
-  console.log()
 
   return winner
 }
@@ -158,10 +164,11 @@ export function listCandidates(candidates) {
 
   console.log(`\n  ${bold('All found sessions')} ${dim('(ranked by score)')}\n`)
 
+  const browserWidth = Math.max(...candidates.map(c => c.browser.length))
   for (let i = 0; i < candidates.length; i++) {
     const candidate   = candidates[i]
     const unsupported = !candidate.config.table ? `  ${dim(italic('not yet supported'))}` : ''
-    console.log(`  ${candidateLine(candidate, { showScore: true, index: i })}${unsupported}`)
+    console.log(`  ${candidateLine(candidate, { showScore: true, index: i, browserWidth })}${unsupported}`)
   }
   console.log()
 }
@@ -202,22 +209,15 @@ export async function interactivePick(candidates) {
     throw new Error('No supported browser sessions found. (Safari requires a custom parser.)')
   }
 
-  if (valid.length === 1) {
-    console.log(`\n  ${c.bgreen('✔')} Only one session available:\n`)
-    console.log(`  ${candidateLine(valid[0])}`)
-    console.log()
-
-    return valid[0]
-  }
-
   //
   // Render list
   //
   console.log()
   console.log(`  ${bold('Choose a browser session')} ${dim('(ranked by score)')}`)
   console.log()
+  const browserWidth = Math.max(...valid.map(c => c.browser.length))
   for (let i = 0; i < valid.length; i++) {
-    console.log(`  ${candidateLine(valid[i], { showScore: true, index: i, isDefault: i === 0 })}`)
+    console.log(`  ${candidateLine(valid[i], { showScore: true, index: i, isDefault: i === 0, browserWidth })}`)
   }
 
   if (!process.stdin.isTTY) {
@@ -248,7 +248,6 @@ export async function interactivePick(candidates) {
       process.stdin.pause()
       process.stdout.write('\n\n')
       console.log(`  ${c.bgreen('✔')} ${bold('Selected:')} ${bold(candidate.browser)}  ${dim('(manually selected)')}`)
-      console.log()
 
       resolve(candidate)
     }
@@ -262,7 +261,7 @@ export async function interactivePick(candidates) {
     }
 
     process.stdin.on('data', key => {
-      if (key === '\u0003' || key === '\u0004') { abort('Cancelled'); return }
+      if (key === '\u0003' || key === '\u0004') { abort('Cancelled'); return } // Ctrl+C, Ctrl+D
 
       if (singleKey) {
         if (key === '\r' || key === '\n') { done(valid[0]); return }
@@ -280,6 +279,7 @@ export async function interactivePick(candidates) {
         done(isNaN(n) || n < 1 || n > valid.length ? valid[0] : valid[n - 1])
         return
       }
+      // \u007f = DEL — what most terminal emulators send for the Backspace key
       if (key === '\u007f') {
         if (buffer.length > 0) { buffer = buffer.slice(0, -1); process.stdout.write('\b \b') }
         return

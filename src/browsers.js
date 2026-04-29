@@ -2,7 +2,14 @@
 // Extendable table of how to find, identify and query different browsers'
 // session cookie databases.
 //
-// `sizeMin` is the minimum size in KB considered a possibly viable session store.
+// Key per-browser fields:
+//   sizeMin    minimum expected DB size in KB for a signed-in session; rejects
+//              empty or stub profiles before attempting decryption
+//   hostMatch  SQL pattern used to filter YouTube cookies:
+//                leading '.'  → exact '=' match  (Firefox stores host as '.youtube.com')
+//                leading '%'  → LIKE wildcard     (Chromium may store 'youtube.com' or '.youtube.com')
+//   alwaysCopy true for Firefox: it holds an exclusive WAL write lock while running,
+//              so we always snapshot the database before querying
 //
 // Column name reference:
 //   Firefox (moz_cookies):  host, isSecure, isHttpOnly, expiry, sameSite
@@ -20,8 +27,14 @@ const CHROMIUM_COLS = {
   httpOnly:  'is_httponly',
   expiry:    'expires_utc',
   sameSite:  'samesite',
-  encrypted: 'encrypted_value',
+  encrypted: 'encrypted_value',  // absent on Firefox — its cookies are stored as plaintext
 }
+
+// Chromium 96+ (Nov 2021) moved the cookie file into a Network/ subdirectory.
+// dbName is tried first; dbFallback is used for older installs where the file
+// still lives directly in the profile root.
+const CHROMIUM_DB = 'Network/Cookies'
+const CHROMIUM_DB_LEGACY = 'Cookies'
 
 //
 // Shared profile path patterns for Linux and BSDs.
@@ -57,7 +70,7 @@ export const BROWSERS = {
 
   chrome: {
     name: 'Chrome',
-    dbName: 'Cookies',
+    dbName: CHROMIUM_DB, dbFallback: CHROMIUM_DB_LEGACY,
     fileType: 'cookie-database',
     alwaysCopy: false,
     table: 'cookies',
@@ -66,14 +79,14 @@ export const BROWSERS = {
     sizeMin: 32,
     profiles: {
       darwin: ['~/Library/Application Support/Google/{Chrome,Chrome Beta,Chrome Dev,Chromium}/*/'],
-      win32:  ['%LOCALAPPDATA%/Google/{Chrome,Chrome Beta,Chrome Dev,Chromium}/User Data/*'],
+      win32:  ['%LOCALAPPDATA%/Google/{Chrome,Chrome Beta,Chrome Dev,Chromium}/User Data/*/'],
       ...unixPaths(['~/.config/google-chrome*/*', '~/.config/chromium/*']),
     },
   },
 
   opera: {
     name: 'Opera',
-    dbName: 'Cookies',
+    dbName: CHROMIUM_DB, dbFallback: CHROMIUM_DB_LEGACY,
     fileType: 'cookie-database',
     alwaysCopy: false,
     table: 'cookies',
@@ -95,7 +108,7 @@ export const BROWSERS = {
 
   edge: {
     name: 'Edge',
-    dbName: 'Cookies',
+    dbName: CHROMIUM_DB, dbFallback: CHROMIUM_DB_LEGACY,
     fileType: 'cookie-database',
     alwaysCopy: false,
     table: 'cookies',
@@ -104,14 +117,14 @@ export const BROWSERS = {
     sizeMin: 32,
     profiles: {
       darwin: ['~/Library/Application Support/Microsoft Edge/*/'],
-      win32:  ['%LOCALAPPDATA%/Microsoft/Edge/User Data/*'],
+      win32:  ['%LOCALAPPDATA%/Microsoft/Edge/User Data/*/'],
       ...unixPaths(['~/.config/microsoft-edge/*']),
     },
   },
 
   brave: {
     name: 'Brave',
-    dbName: 'Cookies',
+    dbName: CHROMIUM_DB, dbFallback: CHROMIUM_DB_LEGACY,
     fileType: 'cookie-database',
     alwaysCopy: false,
     table: 'cookies',
@@ -120,7 +133,7 @@ export const BROWSERS = {
     sizeMin: 32,
     profiles: {
       darwin: ['~/Library/Application Support/BraveSoftware/Brave-Browser/*/'],
-      win32:  ['%LOCALAPPDATA%/BraveSoftware/Brave-Browser/User Data/*'],
+      win32:  ['%LOCALAPPDATA%/BraveSoftware/Brave-Browser/User Data/*/'],
       ...unixPaths(['~/.config/BraveSoftware/Brave-Browser/*']),
     },
   },
@@ -191,11 +204,11 @@ export function getQuery(config) {
     throw new Error(`${config.name}: Not yet supported`)
   }
 
-  // Collect browser specifics
   const { host, secure, httpOnly, expiry, sameSite, encrypted } = config.cols
+  // A '%' in hostMatch signals a LIKE wildcard (Chromium); absence of '%' uses exact '='  (Firefox)
   const operator = config.hostMatch.includes('%') ? 'LIKE' : '='
 
-  // Also read the encrypted column for browsers that use it
+  // Firefox has no encrypted_value column — its cookies are plaintext; omit for non-Chromium browsers
   const andEncryptedValue = encrypted ? `, ${encrypted} AS encryptedValue` : ''
 
   return [

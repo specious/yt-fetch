@@ -1,20 +1,18 @@
-//
-// Shared application constants
-//
-// Imported by cli.js, find-cookies.js, and any future modules that need
-// to display the app name or version without re-reading package.json.
-//
-
 import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
+// ESM modules lack __dirname — derive it from the module's own URL.
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Read in package.json
 const pkg = JSON.parse(
   await fs.readFile(path.join(__dirname, '../package.json'), 'utf8')
 )
+
+//
+// Shared application constants — imported wherever the app name or version
+// is needed without re-reading package.json at the call site.
+//
 
 export const APP_NAME    = pkg.name    ?? 'yt-fetch'
 export const APP_VERSION = pkg.version ?? '(unknown version)'

@@ -1,3 +1,5 @@
+import { readFileSync, existsSync, readdirSync } from 'fs'
+
 import { dim, bold, c } from './ansi.js'
 
 //
@@ -29,6 +31,133 @@ const SCROLL_STALL = 3     // Stop after this many scrolls with no new items
 function log(msg)   { console.log(`  ${dim('·')}  ${msg}`) }
 function logOk(msg) { console.log(`  ${c.bgreen('✔')}  ${msg}`) }
 
+// WSL_DISTRO_NAME and WSL_INTEROP are injected by the Windows host kernel in modern WSL.
+// The /proc/version fallback catches older WSL 1 environments where neither variable is set.
+function isWSL() {
+  if (process.platform !== 'linux') return false
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true
+  try { return /microsoft|wsl/i.test(readFileSync('/proc/version', 'utf8')) } catch { return false }
+}
+
+// Map missing shared-library names → apt package names so we can give targeted install hints.
+const SO_TO_PKG = {
+  'libglib-2.0.so':       'libglib2.0-0',
+  'libgtk-3.so':          'libgtk-3-0',
+  'libmozgtk.so':         'libgtk-3-0',
+  'libnss3.so':           'libnss3',
+  'libnspr4.so':          'libnspr4',
+  'libatk-1.0.so':        'libatk1.0-0',
+  'libatk-bridge-2.0.so': 'libatk-bridge2.0-0',
+  'libcups.so':           'libcups2',
+  'libdrm.so':            'libdrm2',
+  'libxkbcommon.so':      'libxkbcommon0',
+  'libgbm.so':            'libgbm1',
+  'libpango-1.0.so':      'libpango-1.0-0',
+  'libcairo.so':          'libcairo2',
+  'libdbus-glib-1.so':    'libdbus-glib-1-2',
+  'libdbus-1.so':         'libdbus-1-3',
+  'libxt.so':             'libxt6',
+  'libasound.so':         'libasound2',
+  'libxss.so':            'libxss1',
+  'libxrandr.so':         'libxrandr2',
+  'libxi.so':             'libxi6',
+  'libfontconfig.so':     'libfontconfig1',
+  'libexpat.so':          'libexpat1',
+}
+
+function missingLibPackages(...errMessages) {
+  const pkgs = new Set()
+  for (const msg of errMessages) {
+    for (const [, lib] of (msg ?? '').matchAll(/(\S+\.so[.\d]*): cannot open shared object file/g)) {
+      const base = lib.replace(/\.so[.\d]*$/, '.so')
+      const pkg = SO_TO_PKG[lib] || SO_TO_PKG[base]
+      if (pkg) pkgs.add(pkg)
+    }
+  }
+  return [...pkgs]
+}
+
+// Find a Firefox binary usable by Puppeteer (system install or Puppeteer's own cache).
+function findSystemFirefox() {
+  // System-installed paths (common on Debian/Ubuntu/Arch/Fedora)
+  const systemPaths = [
+    '/usr/bin/firefox',
+    '/usr/bin/firefox-esr',
+    '/snap/bin/firefox',
+    '/usr/local/bin/firefox',
+    '/usr/lib/firefox/firefox',
+    '/usr/lib/firefox-esr/firefox-esr',
+  ]
+  for (const p of systemPaths) {
+    if (existsSync(p)) return p
+  }
+
+  // Puppeteer's own downloaded Firefox cache (~/.cache/puppeteer/firefox/...)
+  const home = process.env.HOME || process.env.USERPROFILE || ''
+  const puppeteerCache = `${home}/.cache/puppeteer/firefox`
+  if (existsSync(puppeteerCache)) {
+    // Walk one level: firefox/<platform>-<version>/firefox/firefox
+    try {
+      for (const d of readdirSync(puppeteerCache)) {
+        const candidate = `${puppeteerCache}/${d}/firefox/firefox`
+        if (existsSync(candidate)) return candidate
+      }
+    } catch {}
+  }
+
+  return null
+}
+
+// Extract the first meaningful line from a Puppeteer launch-failure message.
+// Puppeteer wraps errors in a verbose block that includes full stderr and a
+// troubleshooting URL; we only want the root cause.
+function briefLaunchError(msg = '') {
+  // "error while loading shared libraries: libfoo.so: cannot open..."
+  const soMatch = msg.match(/error while loading shared libraries: (\S+)/)
+  if (soMatch) return `missing ${soMatch[1]}`
+  // "XPCOMGlueLoad error for file …/libmozgtk.so:\nlibgtk-3.so.0: cannot open…"
+  const xpMatch = msg.match(/\n(\S+): cannot open shared object file/)
+  if (xpMatch) return `missing ${xpMatch[1]}`
+  // Fall back to the first non-empty line, capped at 100 chars
+  const first = msg.split('\n').find(l => l.trim()) ?? msg
+  return first.length > 100 ? first.slice(0, 100) + '…' : first
+}
+
+// Called when both Chrome and Firefox (if tried) fail to launch in WSL.
+// Prints a compact, structured error and exits.
+function wslLaunchFailed(chromeErr, ffErr, firefoxPath) {
+  const err = s => console.error(`  ${s}`)
+
+  console.error()
+  err(`✖  Browser launch failed in WSL`)
+  console.error()
+  err(`   Chrome:   ${briefLaunchError(chromeErr?.message)}`)
+  if (ffErr) {
+    err(`   Firefox:  ${briefLaunchError(ffErr?.message)}`)
+  }
+  console.error()
+
+  const pkgs = missingLibPackages(chromeErr?.message, ffErr?.message)
+  if (pkgs.length > 0) {
+    err(`   Install the missing system libraries and retry:`)
+    err(`     sudo apt install -y ${pkgs.join(' ')}`)
+    console.error()
+    if (!ffErr) {
+      // Firefox was found but not yet tried — it may also need libs
+      err(`   Alternatively, Puppeteer can download a self-contained Firefox:`)
+      err(`     bun x puppeteer browsers install firefox`)
+    }
+  } else if (!firefoxPath) {
+    err(`   No Firefox binary found. Install one, then retry:`)
+    err(`     bun x puppeteer browsers install firefox   # distro-agnostic`)
+    err(`     sudo apt install -y firefox-esr            # Debian/Ubuntu`)
+  } else {
+    err(`   Both browsers failed. Check the errors above for details.`)
+  }
+
+  process.exit(1)
+}
+
 export async function scrapeHistory(cookies, opts = {}) {
   const { maxVideos = null, debug = false } = opts
 
@@ -49,13 +178,54 @@ export async function scrapeHistory(cookies, opts = {}) {
     process.exit(1)
   }
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  })
+  const wsl = isWSL()
 
-  const context = await browser.createBrowserContext()
-  const page    = await context.newPage()
+  // --no-sandbox / --disable-setuid-sandbox: needed when running as root (Docker, CI).
+  // WSL-specific: --disable-gpu (no drivers), --disable-dev-shm-usage (/dev/shm is
+  // only 64 MB by default in WSL), --no-zygote (avoids sandbox failures in WSL's
+  // process namespace).
+  const chromeArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    ...(wsl ? ['--disable-gpu', '--disable-dev-shm-usage', '--no-zygote'] : []),
+  ]
+
+  let browser
+  try {
+    browser = await puppeteer.launch({ headless: true, args: chromeArgs })
+  } catch (chromeErr) {
+    if (wsl) {
+      // Chrome often fails in WSL due to missing shared libraries.
+      // Try a system/Puppeteer-cached Firefox before giving up.
+      const firefoxPath = findSystemFirefox()
+      if (firefoxPath) {
+        log(`Chrome unavailable in WSL — trying Firefox  ${dim(firefoxPath)}`)
+        try {
+          browser = await puppeteer.launch({ browser: 'firefox', headless: true, executablePath: firefoxPath })
+        } catch (ffErr) {
+          wslLaunchFailed(chromeErr, ffErr, firefoxPath)
+        }
+      } else {
+        wslLaunchFailed(chromeErr, null, null)
+      }
+    } else if (chromeErr.message?.includes('Could not find Chrome')) {
+      console.error('\n  Install the headless browser with: bun install')
+      console.error('  (or: bun x puppeteer browsers install chrome)')
+      process.exit(1)
+    } else {
+      console.error(`\n  ${chromeErr.message}`)
+      process.exit(1)
+    }
+  }
+
+  // Firefox BiDi may not support isolated contexts — fall back to the default.
+  let context
+  try {
+    context = await browser.createBrowserContext()
+  } catch {
+    context = browser.defaultBrowserContext()
+  }
+  const page = await context.newPage()
 
   try {
     //
@@ -77,14 +247,14 @@ export async function scrapeHistory(cookies, opts = {}) {
 
     if (debug) {
       const seen = await context.cookies([HISTORY_URL])
-      console.log(`  ${dim('│')}  ${dim('cookies visible to browser:')}`)
+      console.log(`  ${dim('│')}  ${dim('Cookies visible to browser:')}`)
       console.log(`  ${dim('│')}  ${c.ansi256(252)(seen.map(ck => ck.name).sort().join(dim(', ')))}`)
     }
 
     //
     // Navigate to history
     //
-    log(`Navigating  ${dim(HISTORY_URL)}`)
+    log(`Navigating to: ${dim(HISTORY_URL)}`)
 
     await page.goto(HISTORY_URL, { waitUntil: 'networkidle0', timeout: 20_000 })
 
@@ -97,15 +267,15 @@ export async function scrapeHistory(cookies, opts = {}) {
     // Verify "logged in" state
     //
     const auth = await page.evaluate(() => ({
-      signedIn:      !!document.querySelector('#avatar-btn, yt-img-shadow#avatar'),
+      signedIn: !!document.querySelector('#avatar-btn, yt-img-shadow#avatar'),
       historyLoaded: !!document.querySelector('ytd-history-entry-renderer, #contents ytd-video-renderer, yt-lockup-view-model'),
-      title:         document.title,
+      title: document.title,
     }))
 
     if (debug) {
-      log(`page title:  ${dim(auth.title)}`)
-      log(`signed in:   ${auth.signedIn ? c.bgreen('yes') : c.bred('no')}`)
-      log(`history DOM: ${auth.historyLoaded ? c.bgreen('found') : c.bred('not found')}`)
+      log(`Page title: ${dim(auth.title)}`)
+      log(`Signed in: ${auth.signedIn ? c.bgreen('yes') : c.bred('no')}`)
+      log(`History DOM: ${auth.historyLoaded ? c.bgreen('found') : c.bred('not found')}`)
     }
 
     if (!auth.historyLoaded) {
@@ -181,7 +351,7 @@ export async function scrapeHistory(cookies, opts = {}) {
         return { tag: r.tagName, nodes: nodes.slice(0, 25) }
       })
       if (sample) {
-        log(`first renderer: ${dim(sample.tag)}`)
+        log(`First renderer: ${dim(sample.tag)}`)
         for (const n of sample.nodes) {
           log(`  ${dim(n.tag + (n.id ? '#' + n.id : '') + (n.cls ? '.' + n.cls : ''))}  ${dim(JSON.stringify(n.text))}`)
         }

@@ -131,6 +131,10 @@ export function printJSON(videos, { urlStyle = 'short', sort = 'asc', quiet = fa
 // YAML output — hand-rolled, no deps
 //
 
+// Quote a YAML scalar value with single quotes when necessary.
+// Triggers: YAML flow-indicator/special chars, leading/trailing whitespace,
+// or strings that a YAML parser would misread as a boolean, null, or number.
+// Single-quote style is safe for all content — internal quotes are doubled ('').
 function yamlStr(s) {
   if (!s) return "''"
   if (/[:#\[\]{}&*!|>'"%@`,]/.test(s) || /^\s|\s$/.test(s) ||

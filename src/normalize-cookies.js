@@ -16,6 +16,8 @@ const SKIP_PATTERN = /^ST-[a-z0-9]+$/i
 function normalizeExpiry(raw) {
   const n = Number(raw ?? -1)
 
+  // Return undefined so the caller can omit `expires` entirely — Puppeteer
+  // treats a missing expires as a session cookie, not a -1 sentinel.
   if (n <= 0)
     return undefined
 
@@ -78,6 +80,9 @@ export function normalizeCookies(rawCookies, targetDomains = ['.youtube.com', '.
     })
     .filter(c => c.name && c.value && c.domain)
 
+  // Drop cookies whose domain doesn't overlap any YouTube property. Belt-and-suspenders
+  // guard: a browser profile accumulates cookies for many sites and the SQL query
+  // already filters by hostMatch, but this catches any edge cases that slip through.
   const filtered = normalized.filter(c =>
     targetDomains.some(target =>
       c.domain === target ||

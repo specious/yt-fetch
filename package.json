@@ -1,6 +1,6 @@
 {
   "name": "yt-fetch",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "Fetch your personal YouTube watch history using cookies from any installed browser — no API keys, no OAuth",
   "license": "ISC",

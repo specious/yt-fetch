@@ -70,11 +70,26 @@ export function renderCookie(cookie) {
     const key = dim(pad(k, 16))
 
     if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
-      const buf    = Buffer.isBuffer(v) ? v : Buffer.from(v)
-      const prefix = buf.subarray(0, 3).toString('ascii').replace(/[^\x20-\x7e]/g, '?')
-      const hex    = [...buf.subarray(0, 8)].map(b => b.toString(16).padStart(2, '0')).join(' ')
-      const more   = buf.length > 8 ? dim(` …+${buf.length - 8}B`) : ''
-      return `${indent}${key}  ${c.ansi256(208)(prefix)} ${dim(hex)}${more}`
+      const buf     = Buffer.isBuffer(v) ? v : Buffer.from(v)
+      const tag     = buf.subarray(0, 3).toString('ascii')
+      // A known Chromium encryption prefix (v10/v11/v20) is shown as a labelled
+      // tag on the field line; hex rows then start from byte 3 at a fixed column.
+      const hasTag  = /^v[12]\d$/.test(tag)
+      const hexBuf  = hasTag ? buf.subarray(3) : buf
+      const contPad = `${indent}${' '.repeat(18)}`
+      const rows    = []
+
+      if (hasTag) {
+        rows.push(`${indent}${key}  ${c.ansi256(208)(tag)} ${dim('(' + buf.length + ' bytes)')}`)
+      }
+
+      for (let off = 0; off < hexBuf.length; off += 16) {
+        const row = [...hexBuf.subarray(off, off + 16)].map(b => b.toString(16).padStart(2, '0')).join(' ')
+        rows.push((!hasTag && off === 0)
+          ? `${indent}${key}  ${dim(row)}`
+          : `${contPad}${dim(row)}`)
+      }
+      return rows.join('\n')
     }
 
     if (typeof v === 'string') {

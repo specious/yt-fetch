@@ -28,6 +28,9 @@ function wrap(open, close) {
 }
 
 // Text styles
+// Closing codes: 22=normal intensity (resets bold+dim without clobbering colour),
+// 23=italic off, 24=underline off. reset(0) would clear colour too, breaking
+// nested constructs like dim(bold('text')) inside a colour wrapper.
 export const bold   = wrap(esc(1),  esc(22))
 export const dim    = wrap(esc(2),  esc(22))
 export const italic = wrap(esc(3),  esc(23))

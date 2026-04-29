@@ -1,65 +1,169 @@
 # yt-fetch
 
-Fetch your personal YouTube watch history **without API keys, OAuth, or manual cookie exports**.
+Get your YouTube watch history as formatted text, JSON, or YAML — **no API key, no Google Cloud project, no manual cookie export**.
 
-`yt-fetch` discovers signed-in browser sessions on your machine, decrypts cookies locally, and uses a headless browser to load YouTube just like a real user session. It currently focuses on recent watch history and related metadata, with plans to expand to other personal data.
+`yt-fetch` finds your already-signed-in browser sessions, reads their cookies (decrypting them locally using your OS's own credential store), and loads your history page in a temporary private browser window. Everything runs on your machine.
 
-## Features
+## What you get
 
-- Automatically detects installed browsers and profiles
-- Decrypts cookies locally
-  - Firefox: plaintext
-  - Chromium: AES-128-CBC (macOS Keychain, Linux libsecret/kwallet/basic, Windows DPAPI)
-- Selects the best available signed-in session automatically (without `-i`)
-- Lets you choose which browser session to use (with `-i`)
-- Fetches data using headless browsing using injected cookies
-- Multiple output formats: pretty, JSON, YAML
-- Debug tooling: `--dry-run`, `--debug`
-- Fully local: no API calls, no external data transmission
+```
+────────────────────────────────────────────────────────────
+  ▶ 47 videos in watch history
+────────────────────────────────────────────────────────────
+
+  The Art of Code (1:00:49)
+  Dylan Beattie · 1.8M views
+  https://youtu.be/6avJHaC3C2U
+
+  Inventing on Principle (54:20)
+  Bret Victor · 2.2M views
+  https://youtu.be/PUv66718DII
+
+  Bun 1.0 (1:10:44)
+  Jarred Sumner · 520K views
+  https://youtu.be/BsnCpESUEqM
+```
+
+Or pipe to other tools:
+
+```sh
+bin/yt -q --output json | jq '[.[] | {title, url}]'
+```
+
+## Before you run
+
+Make sure you are **signed in to YouTube** in at least one supported browser on this machine. `yt-fetch` reads your existing session — it does not log in for you.
 
 ## Quick Start
+
+**1. Install Bun** (an all-in-one JavaScript runtime optimized for performance — [bun.sh](https://bun.sh)):
+
+```sh
+# macOS / Linux
+curl -fsSL https://bun.sh/install | bash
+
+# Windows (PowerShell)
+powershell -c "irm bun.sh/install.ps1 | iex"
+```
+
+Already have Bun? Skip to step 2.
+
+**2. Clone and run:**
 
 ```sh
 git clone https://github.com/specious/yt-fetch
 cd yt-fetch
-bun install
+bun install    # also downloads the headless Chromium used for scraping (~300 MB)
 bin/yt
 ```
 
-- **Runtime:** Bun
-- **Only dependency:** Puppeteer (headless browser)
+`yt-fetch` scans your browsers automatically and picks the best signed-in session. No configuration needed.
 
-Fork it, break it, extend it.
+### Windows
 
-## Why Bun
+```powershell
+git clone https://github.com/specious/yt-fetch
+cd yt-fetch
+bun install
+bun .\bin\yt
+```
 
-- Built-in SQLite via `bun:sqlite` (no extra deps)
-- Fast filesystem scanning with `Bun.Glob`
-- Fast startup for snappy performance
-- Uses Bun-specific APIs (not compatible with Node.js)
+Windows has no shebang equivalent, so prefix with `bun`. To create a plain `yt` command, save a `yt.cmd` file somewhere on your PATH:
 
-## Requirements
+```bat
+@bun "C:\full\path\to\yt-fetch\bin\yt" %*
+```
 
-- Bun ≥ 1.0.14
-- macOS 13+, Linux (kernel 5.1+), or Windows 10 (1809+)
-- A signed-in YouTube session in: Firefox, Chrome, Brave, Edge, or Opera
+**Firefox and Opera work out of the box.** Chrome and Edge do not — see [below](#chrome-and-edge-on-windows--v20-encryption).
 
-**Notes**
+## Features
 
-- Firefox is the most portable (plaintext cookies)
-- Chromium-based browsers require OS keyring access
-- You may see keychain/keyring prompts during execution
+- **Zero configuration** — detects your installed browsers and profiles, picks the best signed-in session automatically
+- **Fully local** — cookies are decrypted on your machine using the same OS credential store that already protects them; nothing leaves your machine
+  - Firefox: cookies are stored in plaintext — no keyring, no prompt
+  - Chrome, Edge, Brave, Opera: decrypted via macOS Keychain, Linux libsecret/KWallet, or Windows DPAPI
+- **Multiple output formats** — human-readable (default), JSON, YAML
+- **Interactive session picker** — `-i` to choose which browser profile to use
+- **Debug tooling** — `--dry-run` verifies cookie extraction without opening a browser; `--debug` shows every stage of the pipeline
 
-## How It Works
+## Platform Notes
 
-1. Locate browser profile directories
-2. Extract and decrypt cookies locally
-3. Launch headless Chromium via Puppeteer
-4. Inject cookies into a session
-5. Load YouTube and extract structured data
-6. Output results
+### macOS
 
-No Google APIs. No tokens. No network services beyond YouTube itself.
+All browsers work. You may see one or two Keychain prompts when using Chrome, Edge, Brave, or Opera — click **Allow** or **Always Allow** on each.
+
+### Linux
+
+All browsers work. Chrome-based browsers read their decryption key from whichever secret store was active when you first launched that browser:
+
+- **GNOME Keyring** (libsecret) — queried automatically, no prompt
+- **KWallet** — queried automatically via `kwallet-query`
+- **No keyring** (basic mode) — works without any keyring daemon
+
+Firefox always stores cookies in plaintext and needs no keyring at all.
+
+### Windows (native)
+
+**Firefox and Opera work out of the box.** Chrome and Edge do not — see below.
+
+#### Chrome and Edge on Windows — v20 encryption
+
+Chrome 127+ and Edge 127+ switched to **app-bound (v20) cookie encryption**, where the AES key is held by an OS elevation service (`IElevator` COM) that only the browser process itself can call. There is no practical way to decrypt these cookies from outside the browser.
+
+```
+  ✔  21 v20
+  ⚠  All cookies use v20 app-bound encryption (Chrome/Edge 130+ blocks offline decryption)
+     → Use Firefox instead:  bun .\bin\yt -b firefox
+```
+
+**Workaround:** Use Firefox on Windows. Firefox stores cookies in plaintext — no encryption, no keyring, no elevation service.
+
+#### Opera on Windows
+
+Opera uses DPAPI (v10) encryption and works correctly. Opera Developer is also supported.
+
+### WSL (Windows Subsystem for Linux)
+
+WSL is Microsoft's compatibility layer that lets you run Linux tools directly on Windows. `yt-fetch` works in WSL and gets the best of both worlds: it scans both Linux-native browser profiles **and** Windows-native profiles under `/mnt/c/Users/*/AppData/`.
+
+#### Reading cookies
+
+Cookie extraction works for all browsers found, subject to the same encryption rules as Windows native. In practice:
+
+- **Windows Firefox** (found via `/mnt/c`): cookies extracted cleanly — recommended
+- **Windows Opera** (found via `/mnt/c`): cookies extracted cleanly
+- **Windows Chrome/Edge** (found via `/mnt/c`): v20 encryption — cannot decrypt, use Firefox instead
+- **WSL-native Firefox** (installed inside WSL): works, cookies at `~/.mozilla/firefox/`
+
+#### Launching the headless browser
+
+Both Puppeteer's bundled Chromium and its downloadable Firefox need system libraries that a minimal WSL image (e.g. Debian slim) won't have. `yt-fetch` detects failures and tells you exactly which packages are missing:
+
+```
+  ✖  Browser launch failed in WSL
+
+     Chrome:   missing libglib-2.0.so.0
+     Firefox:  missing libgtk-3.so.0
+
+     Install the missing system libraries and retry:
+       sudo apt install -y libglib2.0-0 libgtk-3-0
+```
+
+Follow the suggested `apt install` command, then re-run. Depending on how minimal your install is, you may need to repeat this once or twice as additional libraries surface.
+
+> **Note:** `bun x puppeteer browsers install firefox` downloads the Firefox binary but does **not** install the GTK/glib system libraries it depends on. You still need `apt` for those.
+
+#### Recommended WSL workflow
+
+`yt-fetch` has two distinct phases in WSL, and only the second runs into trouble:
+
+1. **Cookie extraction** — reads browser profiles from disk, including Windows-native profiles under `/mnt/c`. Works automatically.
+
+2. **Headless browser launch** — Puppeteer starts Chrome or Firefox inside WSL. This is where minimal distros hit missing-library errors.
+
+Get step 2 working by following whatever `apt install` hint the tool prints, then re-run. The exact library set varies by distro and how minimal it is — `yt-fetch` identifies what's missing as you go.
+
+> We haven't yet determined a fully tested, out-of-the-box headless browser setup for minimal WSL environments. Contributions and test reports are welcome.
 
 ## Usage
 
@@ -67,165 +171,133 @@ No Google APIs. No tokens. No network services beyond YouTube itself.
 bin/yt [options]
 ```
 
-Examples:
-
 ```sh
-bin/yt -i                     # interactive session selection
-bin/yt -b opera               # force specific browser
-bin/yt -b firefox --debug     # verbose pipeline output
-bin/yt -q --output json       # machine-readable output
-bin/yt --dry-run              # test cookie extraction only
-bin/yt --video-url canonical  # full youtube.com/watch?v= URLs
+bin/yt -i                     # choose which browser session to use interactively
+bin/yt -b firefox             # use Firefox, auto-pick best profile
+bin/yt -b firefox --debug     # see every step of the pipeline
+bin/yt -q --output json       # clean JSON for piping to jq or other tools
+bin/yt --dry-run              # verify cookies without launching a browser
+bin/yt --video-url canonical  # full youtube.com/watch?v= URLs instead of youtu.be
+bin/yt -n 20                  # stop after 20 videos
 ```
 
-Output formats: `pretty` (default), `json`, `yaml`
+**Output formats:** `pretty` (default), `json`, `yaml`
+
+**Note on sort order:** YouTube's history feed is reverse-chronological (most recently watched first), and `yt-fetch` preserves that. `--sort asc` (the default) keeps the most recent video at the top; `--sort desc` reverses the list so your oldest watched video comes first.
 
 ## Browser Support
 
-> “Known working” means tested end-to-end. Others may work but haven't been verified on that platform yet.
+| Browser | macOS | Linux | Windows | WSL |
+|---|:---:|:---:|:---:|:---:|
+| Firefox | ✅ | ✅ | ✅ | ✅ |
+| Opera | ✅ | ✅ | ✅ | ✅ via `/mnt/c` |
+| Chrome / Brave | ✅ | ✅ | ❌ v20 | ❌ v20 |
+| Edge | ✅ | ✅ | ❌ v20 | ❌ v20 |
+| Safari | 🚧 planned | — | — | — |
 
-| Browser | macOS | Linux | Windows |
-|---|---:|---:|---:|
-| Firefox | ✅ Known working | ✅ Known working | ✅ Known working |
-| Chrome / Brave / Edge | ✅ Known working | ✅ Known working | ⚠️ Untested |
-| Opera | ✅ Known working | ✅ Known working | ⚠️ Untested |
-| Safari | 🚧 Planned | — | — |
-| Chrome 127+ (Win v20) | — | — | ❌ Not supported |
+**v20** = Chrome/Edge 127+ app-bound encryption — cannot be decrypted outside the browser process. Use Firefox instead.
 
-**Linux notes**
+## How It Works
 
-Chromium-based browsers encrypt cookies using whichever secret store was available at first launch:
+1. **Scan** — find cookie databases across all browser profiles installed on this machine
+2. **Extract** — read and decrypt the YouTube cookies using your OS's own credential store
+3. **Inject** — open a temporary, isolated headless browser window (Chromium or Firefox running invisibly in the background) and load those cookies into it, so the browser is authenticated as you
+4. **Scrape** — navigate to `youtube.com/feed/history`, scroll through the page to load the full list, and extract video titles, channels, durations, and URLs from the DOM
+5. **Output** — print results in the requested format and close the browser
 
-- **GNOME Keyring** (libsecret) — queried automatically, no prompt
-- **KWallet** — queried automatically via `kwallet-query`
-- **No keyring** (basic mode) — cookies are encrypted with a fixed fallback key; works without any keyring daemon
+No Google APIs. No tokens. No network requests beyond YouTube itself.
 
-All three paths are supported. Firefox always uses plaintext cookies and needs no keyring at all.
+## Privacy & Security
 
-### Known Issues
+All processing is local:
 
-- Keyring prompts can interrupt automation on macOS
-- Puppeteer/Chromium may fail on older macOS versions (see below)
+- **Cookies never leave your machine.** They are read from your browser's on-disk database and decrypted using the same OS credential store that already protects them (macOS Keychain, Linux libsecret/KWallet, Windows DPAPI).
+- **The headless browser session is isolated.** It runs in a blank, temporary profile — completely separate from your normal browser. It cannot access your real browsing history, saved passwords, extensions, or other sessions. It opens, loads your history page, and closes.
+- **No external services.** The only outbound network traffic is the headless browser loading `youtube.com`.
+
+## Requirements
+
+- [Bun](https://bun.sh) ≥ 1.0.14
+- macOS 13+, Linux (kernel 5.1+), or Windows 10 (1809+) / WSL 2
+  - macOS 11 (Big Sur) and 12 (Monterey) support is attempted via a compatibility shim — see [Older macOS](#older-macos-big-sur--monterey)
+- A signed-in YouTube session in a supported browser
 
 ## Diagnostics
 
-1. Test cookie extraction:
+Test cookie extraction without launching a browser:
+
 ```sh
 bin/yt --dry-run
 ```
 
-2. Enable debug output:
+Enable full pipeline debug output:
+
 ```sh
 bin/yt --debug
 ```
 
-When filing issues, include:
-
-- OS + version
-- Browser + version
-- Profile path
-- `--dry-run` output
-- `--debug` output
-
-## Troubleshooting
-
-- Use `--dry-run` before headless mode
-- Ensure keyring services are available (Linux/macOS)
-- Allow keychain prompts when requested
-- Advanced: test with a cloned `--user-data-dir` for consistency
+When filing issues, include OS + version, browser + version, profile path, and the output of `--debug`.
 
 ## Older macOS (Big Sur & Monterey)
 
-Bun officially supports macOS 13+, but many users on **Big Sur (11)** and **Monterey (12)** can still run it using the included **ICU compatibility shim**. This shim bundles the missing ICU functions that Bun expects (which are not present on older systems), allowing the CLI to run without requiring a full OS upgrade.
+Bun officially supports macOS 13+, but many users on **Big Sur (11)** and **Monterey (12)** can run it using the included **ICU compatibility shim** (`scripts/install-bun-shim.sh`):
 
-### When you need the shim
+```bash
+bun run patch-bun-on-legacy-macos
+```
 
-- If you run `bun` on Big Sur or Monterey and see errors about **ICU**, **Unicode**, or **missing locale data**, the shim fixes those.
-- The script is located in `scripts/install-bun-shim.sh` and safely patches the installed Bun executable to use `libicucore` through a small compatibility layer.
+With the shim in place, `bun` works — cookie extraction and `--dry-run` work for all supported browser sessions:
 
-### What the shim *does*
+```bash
+bin/yt --dry-run
+```
 
-- Installs a small ICU data bundle that Bun loads at runtime.
-- Restores normal behavior for Bun’s JavaScript runtime, SQLite bindings, and filesystem APIs.
-- Has no effect on newer macOS versions.
+The remaining open problem is **headless browser launch**: Puppeteer's bundled Chromium may fail to start on older macOS, which blocks the final scraping step. There is no known workaround yet.
 
-### What the shim *does not* fix
-
-Even with the shim installed, **Puppeteer’s bundled Chromium may still fail to launch** on older macOS versions. This is a Chromium upstream limitation, not a Bun issue. In practice:
-
-- **Firefox sessions** work best on older macOS.
-- **Chromium/Chrome/Opera/Brave** may fail to launch or crash early.
-- `--dry-run` continues to work reliably, even if Chromium cannot start.
-
-For ongoing discussion and upstream tracking, see:
-
-**https://github.com/oven-sh/bun/issues/6035**
-
-### Recommended workflow on older macOS
-
-1. Install Bun normally.
-2. If Bun errors, run the shim:
-
-   ```bash
-   bun run patch-bun-on-legacy-macos
-   ```
-
-3. Test cookie extraction without launching a browser:
-
-   ```bash
-   bin/yt --dry-run
-   ```
-
-At the moment, this is as far as the tool can go on older macOS systems until a reliable headless-browser path is found.
+See [oven-sh/bun#6035](https://github.com/oven-sh/bun/issues/6035) for upstream tracking.
 
 ## Roadmap
 
 ### In Progress
 
-- Windows testing — native and WSL
-- Better session validation before launching Puppeteer
+- Ensure support for a wide range of browsers
+- Headless browser scraping on WSL and older macOS (Big Sur/Monterey)
 
 ### Under Consideration
 
-- Additional data types: likes, playlists, subscriptions, etc.
-- Safari support (BinaryCookies format parser)
+- Search your watch history
+- Additional data types: likes, playlists, subscriptions
+- Safari support (BinaryCookies parser)
 
 ### Ecosystem Direction
 
-`yt-fetch` is intentionally narrow. It’s designed to compose with other tools:
+`yt-fetch` is intentionally narrow and designed to compose:
 
-- Scheduling → cron, systemd timers, task schedulers
-- Backups → user scripts or external tools
-- Analytics → separate projects consuming JSON/YAML output
-
-## Responsible Use
-
-- Only use on accounts you own or have permission to access
-- Treat extracted data as sensitive
-
-## Compliance
-
-- Follow YouTube Terms of Service
-- Follow applicable laws
-
-This tool is for personal access and research — not bulk scraping or unauthorized access.
-
-## Privacy
-
-All processing happens locally.
-No cookies or personal data are transmitted externally.
+- Scheduling → cron, systemd timers, Task Scheduler
+- Backups → user scripts consuming JSON/YAML output
+- Analytics → separate projects
 
 ## Contributing
 
-PRs and issues are welcome.
+PRs and issues are welcome. Areas where contributions are especially valuable:
 
-Include:
+- **Browser coverage** — testing with unlisted browsers or profiles; support for new Chromium forks
+- **DOM selector updates** — YouTube updates its frontend regularly; if scraping breaks, the selectors in `src/scrape.js` are the first place to look
+- **Platform testing** — WSL setups, unusual Linux configurations, older macOS versions
+- **Safari** — parsing Apple's BinaryCookies format (the format is documented in `src/browsers.js`)
+
+When filing an issue, include:
 
 - OS + version
 - Browser + version + profile path
-- `--dry-run` output
 - `--debug` output
 - Clear reproduction steps
+
+## Responsible Use
+
+- Only use on accounts you own or have explicit permission to access
+- Treat extracted cookies and watch history as sensitive personal data
+- Follow YouTube's Terms of Service and applicable laws in your jurisdiction
 
 ## License
 

@@ -1,5 +1,7 @@
 import { execFileSync } from 'child_process'
 import { createDecipheriv, pbkdf2Sync } from 'crypto'
+import { readFileSync } from 'fs'
+import path from 'path'
 
 import { dim } from './ansi.js'
 
@@ -27,7 +29,10 @@ import { dim } from './ansi.js'
 // needing to know which browser variant wrote the blob.
 //
 // Windows:
-//   v10: DPAPI — CryptUnprotectData on the payload after the 3B prefix
+//   v10: AES-256-GCM. The AES key is stored in the browser's "Local State" file as
+//        os_crypt.encrypted_key (base64). Strip the 5-byte "DPAPI" magic prefix, then
+//        CryptUnprotectData to recover the raw 32-byte key. Each cookie blob is then:
+//        [v10 3B][IV 12B][ciphertext + GCM tag 16B].
 //   v20: app-bound AES (Chrome 127+) — not supported, clear error given
 //
 // Linux key storage:
@@ -39,7 +44,7 @@ import { dim } from './ansi.js'
 //
 
 const ITERATIONS       = 1003  // used with secret-service key
-const ITERATIONS_BASIC = 1     // used with the peanuts fallback key
+const ITERATIONS_BASIC = 1     // 1 iteration (not 1003): the password is a public constant, so PBKDF2 hardening adds nothing
 const KEY_LEN          = 16
 const SALT             = Buffer.from('saltysalt')
 const STANDARD_IV      = Buffer.alloc(16, ' ')  // 16 × 0x20
@@ -235,19 +240,90 @@ function getPasswordLinux(serviceName, browserName) {
   return null
 }
 
-function decryptDPAPI(payloadBuf) {
+// Returns the raw decrypted bytes as a Buffer.
+// Tries CurrentUser scope first, falls back to LocalMachine — some Chromium-based
+// browsers (including some Opera builds) protect the key with LocalMachine scope.
+//
+// Add-Type is required: System.Security.Cryptography.ProtectedData lives in
+// System.Security.dll which PowerShell 5 does not load by default.
+function decryptDPAPIRaw(payloadBuf) {
   const b64 = payloadBuf.toString('base64')
   const ps  = [
+    `Add-Type -AssemblyName System.Security`,
     `$b=[Convert]::FromBase64String('${b64}')`,
-    `$p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,` +
-      `[System.Security.Cryptography.DataProtectionScope]::CurrentUser)`,
+    `try {`,
+    `  $p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,` +
+         `[System.Security.Cryptography.DataProtectionScope]::CurrentUser)`,
+    `} catch {`,
+    `  $p=[System.Security.Cryptography.ProtectedData]::Unprotect($b,$null,` +
+         `[System.Security.Cryptography.DataProtectionScope]::LocalMachine)`,
+    `}`,
     `[Convert]::ToBase64String($p)`,
   ].join(';')
-  const out = execFileSync(
-    'powershell', ['-NoProfile', '-NonInteractive', '-Command', ps],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }
-  )
-  return Buffer.from(out.trim(), 'base64').toString('utf8')
+  try {
+    const out = execFileSync(
+      'powershell', ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 }
+    )
+    return Buffer.from(out.trim(), 'base64')
+  } catch (err) {
+    const detail = err.stderr?.trim() || err.message
+    throw new Error(detail)
+  }
+}
+
+//
+// Windows: load and cache the AES-256-GCM key stored in the browser's Local State file.
+//
+// The key is base64-encoded under os_crypt.encrypted_key. Stripping the 5-byte "DPAPI"
+// magic prefix leaves a raw DPAPI blob; decrypting that yields the 32-byte AES key.
+//
+// Local State lives one directory above the profile root:
+//   profile = .../User Data/Default  →  Local State = .../User Data/Local State
+//
+const winKeyCache  = new Map()
+// Track which browsers had GCM auth failures so decryptCookies can warn once.
+const gcmFailedFor = new Set()
+// Count v20 cookies per browser so we can show a single actionable message.
+const v20CountFor  = new Map()
+
+export function getV20Count(browserName) { return v20CountFor.get(browserName) ?? 0 }
+
+function getChromiumWindowsKey(profileDir) {
+  const cacheKey = profileDir
+  if (winKeyCache.has(cacheKey)) return winKeyCache.get(cacheKey)
+
+  // Locate Local State one directory above the profile root.
+  // Avoid path.join/path.dirname: they normalise to backslashes on Windows which can
+  // produce mixed-separator paths that confuse readFileSync on some Bun versions.
+  const sep        = profileDir.includes('/') ? '/' : '\\'
+  const parentDir  = profileDir.slice(0, profileDir.lastIndexOf(sep))
+  const lsPath     = parentDir + sep + 'Local State'
+
+  let ls
+  try {
+    ls = JSON.parse(readFileSync(lsPath, 'utf8'))
+  } catch (err) {
+    console.warn(`  ⚠  Local State not readable (${lsPath}): ${err.code ?? err.message}`)
+    winKeyCache.set(cacheKey, null); return null
+  }
+
+  const encKeyB64 = ls?.os_crypt?.encrypted_key
+  if (!encKeyB64) {
+    console.warn(`  ⚠  No os_crypt.encrypted_key in Local State — will try fallback decryption`)
+    winKeyCache.set(cacheKey, null); return null
+  }
+
+  // Base64-decode and strip the 5-byte "DPAPI" magic prefix before decrypting
+  const encKeyBuf = Buffer.from(encKeyB64, 'base64').subarray(5)
+  try {
+    const key = decryptDPAPIRaw(encKeyBuf)
+    winKeyCache.set(cacheKey, key)
+    return key
+  } catch (err) {
+    console.warn(`  ⚠  DPAPI decryption of Local State key failed: ${err.message}`)
+    winKeyCache.set(cacheKey, null); return null
+  }
 }
 
 //
@@ -319,7 +395,11 @@ function getDerivedKey(browserName) {
 // then cuts one or more bytes into the actual cookie value.
 function stripPrefixBuffer(buf) {
   if (!buf || buf.length <= 32) return buf
-  // latin1 is a 1:1 byte→char mapping, giving a reliable 32-char prefix check.
+  // Detection heuristic: a SHA256 hash has entropy across the full byte range and will
+  // contain non-ASCII bytes; a real cookie value is printable ASCII. If the first 32
+  // bytes look like binary AND the bytes after them are printable, we have the prefix.
+  // latin1 gives a 1:1 byte→char mapping so the regex sees all 32 bytes without
+  // multi-byte folding — see the function-level comment above for why this matters.
   if (!/^[ -~]{32}/.test(buf.subarray(0, 32).toString('latin1'))
       && isPrintable(buf.subarray(32).toString('utf8'))) {
     return buf.subarray(32)
@@ -327,6 +407,9 @@ function stripPrefixBuffer(buf) {
   return buf
 }
 
+// AES-128-CBC decrypt; returns null on any error (bad padding, wrong key, etc.).
+// The 16-byte alignment guard also naturally rejects GCM-format blobs
+// ([v10 3B][IV 12B][ct][tag 16B]) — their ciphertext+tag length is never block-aligned.
 function tryCBC(key, iv, ct) {
   if (ct.length === 0 || ct.length % 16 !== 0) return null
   try {
@@ -337,20 +420,66 @@ function tryCBC(key, iv, ct) {
   }
 }
 
-function decryptBlob(encryptedValue, browserName) {
+function decryptBlob(encryptedValue, browserName, profileDir = null) {
   const buf    = toBuffer(encryptedValue)
   const prefix = chromiumPrefix(buf)
   if (!prefix) return null
 
   if (prefix.equals(PREFIX_V20)) {
-    throw new Error(
-      'v20 app-bound encryption (Chrome 127+) is not supported on Windows.\n' +
-      '  → Use Firefox, or export cookies via a browser extension instead.'
-    )
+    // Chrome/Edge 127+ app-bound encryption — the AES key is held by the
+    // elevation service (IElevator COM) which rejects calls from non-browser
+    // processes on Chrome/Edge 130+. Skip and report after all cookies run.
+    v20CountFor.set(browserName, (v20CountFor.get(browserName) ?? 0) + 1)
+    return null
   }
 
   if (process.platform === 'win32' && prefix.equals(PREFIX_V10)) {
-    try { return decryptDPAPI(buf.subarray(PREFIX_LEN)) } catch { return null }
+    //
+    // Path 1: AES-256-GCM with key from Local State (Chrome 80+ / Opera normal mode)
+    // blob: [v10 3B][IV 12B][ciphertext][GCM tag 16B]
+    //
+    // Newer Chromium builds also prepend a 32-byte SHA256(host_key) domain-binding
+    // prefix to the plaintext before encrypting — strip it the same way Linux does.
+    //
+    if (profileDir) {
+      const aesKey = getChromiumWindowsKey(profileDir)
+      if (aesKey) {
+        const ct  = buf.subarray(PREFIX_LEN)
+        const iv  = ct.subarray(0, 12)
+        const tag = ct.subarray(ct.length - 16)
+        const enc = ct.subarray(12, ct.length - 16)
+        try {
+          const d = createDecipheriv('aes-256-gcm', aesKey, iv)
+          d.setAuthTag(tag)
+          const plain = Buffer.concat([d.update(enc), d.final()])
+          return stripPrefixBuffer(plain).toString('utf8')
+        } catch {
+          gcmFailedFor.add(browserName)
+        }
+      }
+    }
+
+    //
+    // Path 2: AES-128-CBC peanuts (Chromium basic-mode fallback — same scheme as Linux
+    // when no secret service is available). Opera Developer uses this on Windows when
+    // DPAPI key storage fails (os_crypt.portal.prev_init_success = false in Local State).
+    //
+    // The GCM blob layout ([v10][IV 12B][ct][tag 16B]) is not 16-byte aligned so tryCBC
+    // rejects it immediately; peanuts only fires for actual CBC-format blobs.
+    //
+    const peanutsKey = pbkdf2Sync(Buffer.from(PEANUTS_PASSWORD), SALT, ITERATIONS_BASIC, KEY_LEN, 'sha1')
+    const ct = buf.subarray(PREFIX_LEN)
+    const peanutsBuf = tryCBC(peanutsKey, STANDARD_IV, ct)
+    if (peanutsBuf) {
+      const stripped = stripPrefixBuffer(peanutsBuf)
+      const v = stripped.toString('utf8')
+      if (isPrintable(v)) return v
+    }
+
+    //
+    // Path 3: direct DPAPI (very old Chrome pre-80 blobs)
+    //
+    try { return decryptDPAPIRaw(buf.subarray(PREFIX_LEN)).toString('utf8') } catch { return null }
   }
 
   // macOS / Linux / BSD: AES-128-CBC, PBKDF2-derived key
@@ -398,8 +527,9 @@ function decryptBlob(encryptedValue, browserName) {
 // Public API
 //
 
-// Pass only the encrypted cookies to this function
-export function decryptCookies(cookies, browserName) {
+// Pass only the encrypted cookies to this function.
+// profileDir is required on Windows to locate the Local State file for key extraction.
+export function decryptCookies(cookies, browserName, profileDir = null) {
   const source = { darwin: 'macOS Keychain', linux: 'secret service', win32: 'DPAPI' }
 
   // macOS shows the Keychain prompt up to twice: once per keychain entry that Chrome
@@ -411,7 +541,7 @@ export function decryptCookies(cookies, browserName) {
 
   for (const cookie of cookies) {
     try {
-      const plaintext = decryptBlob(cookie.encryptedValue, browserName)
+      const plaintext = decryptBlob(cookie.encryptedValue, browserName, profileDir)
       if (plaintext !== null && plaintext.length > 0) {
         cookie.value = plaintext
         decrypted++
@@ -436,7 +566,27 @@ export function decryptCookies(cookies, browserName) {
   if (fatalError) {
     throw fatalError
   } else {
-    const failNote = failed > 0 ? `  (${failed} failed)` : ''
-    console.log(`  ✔  ${decrypted} decrypted${failNote}`)
+    const v20 = v20CountFor.get(browserName) ?? 0
+    const failOther = failed - v20
+    const parts = []
+    if (decrypted > 0)  parts.push(`${decrypted} decrypted`)
+    if (v20 > 0)        parts.push(`${v20} v20`)
+    if (failOther > 0)  parts.push(`${failOther} failed`)
+    console.log(`  ✔  ${parts.join(', ')}`)
+
+    if (v20 > 0 && decrypted === 0) {
+      console.warn(`  ⚠  All cookies use v20 app-bound encryption (Chrome/Edge 130+ blocks offline decryption)`)
+      console.warn(`     → Use Firefox instead:  bun ./bin/yt -b firefox`)
+    } else if (v20 > 0) {
+      console.warn(`  ⚠  ${v20} v20 cookies could not be decrypted — some session data may be missing`)
+    } else if (failed > 0 && decrypted === 0 && process.platform === 'win32') {
+      if (gcmFailedFor.has(browserName)) {
+        console.warn(`  ⚠  AES-GCM auth failed — the Local State key may be wrong or cookie blobs use a different layout`)
+        console.warn(`     Run with --debug for more detail`)
+      } else {
+        console.warn(`  ⚠  All cookies failed to decrypt`)
+        console.warn(`     Check that ${browserName}'s "Local State" is readable and the profile path is correct`)
+      }
+    }
   }
 }
